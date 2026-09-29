@@ -125,7 +125,7 @@ async function readJsonResponse(response) {
   }
 }
 
-async function getSharePointToken(siteUrl) {
+async function getGraphToken() {
   const headers = {
     'Content-Type': 'application/x-www-form-urlencoded'
   };
@@ -133,7 +133,7 @@ async function getSharePointToken(siteUrl) {
   const body = new URLSearchParams({
     client_id: config.clientId,
     client_secret: config.clientSecret,
-    scope: `https://${new URL(siteUrl).hostname}/.default`,
+    scope: 'https://graph.microsoft.com/.default',
     grant_type: 'client_credentials'
   });
 
@@ -142,7 +142,7 @@ async function getSharePointToken(siteUrl) {
   const data = await response.json();
 
   if (!response.ok) {
-    throw new Error(`Falha ao obter token do SharePoint: ${data.error_description || JSON.stringify(data)}`);
+    throw new Error(`Falha ao obter token do Microsoft Graph: ${data.error_description || JSON.stringify(data)}`);
   }
 
   return data.access_token;
@@ -151,7 +151,7 @@ async function getSharePointToken(siteUrl) {
 async function fetchListItems(site, filters = {}) {
   const normalizedSite = normalizeSiteConfig(site);
   const siteUrl = normalizedSite.url;
-  const token = await getSharePointToken(siteUrl);
+  const token = await getGraphToken();
 
   const fields = [
     normalizedSite.fields.projetista,
@@ -160,12 +160,14 @@ async function fetchListItems(site, filters = {}) {
     normalizedSite.fields.cidade
   ].filter(Boolean);
 
-  const select = fields.map((field) => field).join(',');
-  const apiUrl = `${siteUrl}/_api/web/lists/getbytitle('${(normalizedSite.listName || '').replace(/'/g, "''")}')/items?$select=${encodeURIComponent(select)}&$top=5000`;
+  const siteHostname = new URL(siteUrl).hostname;
+  const sitePath = new URL(siteUrl).pathname.replace(/\/$/, '');
+  const listName = (normalizedSite.listName || '').replace(/\s+/g, ' ').trim();
+  const graphUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields&$select=${encodeURIComponent(fields.join(','))}&$top=5000`;
 
-  const response = await fetch(apiUrl, {
+  const response = await fetch(graphUrl, {
     headers: {
-      Accept: 'application/json;odata=nometadata',
+      Accept: 'application/json;odata.metadata=none',
       Authorization: `Bearer ${token}`
     }
   });
@@ -173,20 +175,21 @@ async function fetchListItems(site, filters = {}) {
   const payload = await readJsonResponse(response);
 
   if (!response.ok) {
-    const rawText = payload?.rawText || payload?.error?.message?.value || JSON.stringify(payload);
+    const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
     const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
-    throw new Error(`Erro ao consultar lista ${site.listName}: ${detail}`);
+    throw new Error(`Erro ao consultar lista ${normalizedSite.listName}: ${detail}`);
   }
 
-  const items = Array.isArray(payload.value) ? payload.value : payload.d?.results || [];
+  const items = Array.isArray(payload.value) ? payload.value : [];
 
   return items
     .map((item) => {
-      const dataConclusao = getValue(item, normalizedSite.fields.dataConclusao);
+      const fieldData = item.fields || {};
+      const dataConclusao = getValue(fieldData, normalizedSite.fields.dataConclusao);
       const date = parseSharePointDate(dataConclusao);
-      const uf = safeString(getValue(item, normalizedSite.fields.uf)).toUpperCase();
-      const cidade = safeString(getValue(item, normalizedSite.fields.cidade));
-      const projetista = safeString(getValue(item, normalizedSite.fields.projetista));
+      const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
+      const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
+      const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
 
       return {
         date,
