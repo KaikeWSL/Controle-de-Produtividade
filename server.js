@@ -79,10 +79,18 @@ function getValue(item, fieldName) {
   if (!fieldName) return '';
   const key = normalizeFieldName(fieldName);
   if (!key) return '';
-  const directValue = item[key];
+
+  const source = item && item.fields ? item.fields : item;
+
+  const directValue = source[key];
   if (directValue !== undefined && directValue !== null) return directValue;
-  const fallback = item[`${key}`.replace(/_/g, 'x0020')];
+
+  const fallback = source[`${key}`.replace(/_/g, 'x0020')];
   if (fallback !== undefined && fallback !== null) return fallback;
+
+  const aliasKey = Object.keys(source || {}).find((candidate) => candidate.toLowerCase() === key.toLowerCase());
+  if (aliasKey) return source[aliasKey];
+
   return '';
 }
 
@@ -163,7 +171,7 @@ async function fetchListItems(site, filters = {}) {
   const siteHostname = new URL(siteUrl).hostname;
   const sitePath = new URL(siteUrl).pathname.replace(/\/$/, '');
   const listName = (normalizedSite.listName || '').replace(/\s+/g, ' ').trim();
-  const graphUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields&$select=${encodeURIComponent(fields.join(','))}&$top=5000`;
+  const graphUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=5000`;
 
   const response = await fetch(graphUrl, {
     headers: {
