@@ -217,6 +217,7 @@ async function fetchListItems(site, filters = {}) {
     .filter((item) => {
       if (!item.projetista || !item.date) return false;
 
+      if (filters.projetista && item.projetista.toLowerCase() !== String(filters.projetista).toLowerCase()) return false;
       if (filters.uf && item.uf !== filters.uf) return false;
       if (filters.cidade && item.cidade.toLowerCase() !== String(filters.cidade).toLowerCase()) return false;
       if (filters.ano && item.date.getFullYear() !== Number(filters.ano)) return false;
@@ -232,10 +233,12 @@ function buildResult(items) {
   const years = new Set();
   const ufs = new Set();
   const cidades = new Set();
+  const projetistas = new Set();
 
   items.forEach((item) => {
     const nome = item.projetista || 'Não informado';
     byProjetista[nome] = (byProjetista[nome] || 0) + 1;
+    projetistas.add(nome);
 
     if (item.date) {
       const monthIndex = item.date.getMonth();
@@ -265,7 +268,8 @@ function buildResult(items) {
     monthlyTrend: byMonth.map((m) => ({ label: m.label, total: m.total })),
     years: Array.from(years).sort((a, b) => a - b),
     ufs: Array.from(ufs).sort(),
-    cidades: Array.from(cidades).sort((a, b) => a.localeCompare(b))
+    cidades: Array.from(cidades).sort((a, b) => a.localeCompare(b)),
+    projetistas: Array.from(projetistas).sort((a, b) => a.localeCompare(b))
   };
 }
 
@@ -284,6 +288,7 @@ app.get('/api/dashboard', async (req, res) => {
     const siteName = req.query.site || config.sites[0]?.name || config.sites[0]?.siteName;
     const selectedSite = normalizeSiteConfig(getSiteByName(siteName));
     const filters = {
+      projetista: req.query.projetista || '',
       uf: req.query.uf || '',
       cidade: req.query.cidade || '',
       mes: req.query.mes || '',
