@@ -50,7 +50,25 @@ app.use(cors({
 const monthNames = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
 
 function getSiteByName(name) {
-  return config.sites.find((site) => site.name === name) || config.sites[0];
+  return config.sites.find((site) => (site.name || site.siteName) === name) || config.sites[0];
+}
+
+function normalizeSiteConfig(site) {
+  if (!site) return null;
+
+  return {
+    ...site,
+    name: site.name || site.siteName || 'Site',
+    url: site.url || site.siteUrl || '',
+    listName: site.listName || site.listTitle || site.title || '',
+    fields: {
+      ...site.fields,
+      projetista: site.fields?.projetista || site.fields?.project || '',
+      dataConclusao: site.fields?.dataConclusao || site.fields?.dateConclusion || '',
+      uf: site.fields?.uf || site.fields?.state || '',
+      cidade: site.fields?.cidade || site.fields?.city || ''
+    }
+  };
 }
 
 function normalizeFieldName(value) {
@@ -112,18 +130,19 @@ async function getSharePointToken(siteUrl) {
 }
 
 async function fetchListItems(site, filters = {}) {
-  const siteUrl = site.url;
+  const normalizedSite = normalizeSiteConfig(site);
+  const siteUrl = normalizedSite.url;
   const token = await getSharePointToken(siteUrl);
 
   const fields = [
-    site.fields.projetista,
-    site.fields.dataConclusao,
-    site.fields.uf,
-    site.fields.cidade
+    normalizedSite.fields.projetista,
+    normalizedSite.fields.dataConclusao,
+    normalizedSite.fields.uf,
+    normalizedSite.fields.cidade
   ].filter(Boolean);
 
   const select = fields.map((field) => field).join(',');
-  const apiUrl = `${siteUrl}/_api/web/lists/getbytitle('${site.listName.replace(/'/g, "''")}')/items?$select=${encodeURIComponent(select)}&$top=5000`;
+  const apiUrl = `${siteUrl}/_api/web/lists/getbytitle('${(normalizedSite.listName || '').replace(/'/g, "''")}')/items?$select=${encodeURIComponent(select)}&$top=5000`;
 
   const response = await fetch(apiUrl, {
     headers: {
@@ -142,11 +161,11 @@ async function fetchListItems(site, filters = {}) {
 
   return items
     .map((item) => {
-      const dataConclusao = getValue(item, site.fields.dataConclusao);
+      const dataConclusao = getValue(item, normalizedSite.fields.dataConclusao);
       const date = parseSharePointDate(dataConclusao);
-      const uf = safeString(getValue(item, site.fields.uf)).toUpperCase();
-      const cidade = safeString(getValue(item, site.fields.cidade));
-      const projetista = safeString(getValue(item, site.fields.projetista));
+      const uf = safeString(getValue(item, normalizedSite.fields.uf)).toUpperCase();
+      const cidade = safeString(getValue(item, normalizedSite.fields.cidade));
+      const projetista = safeString(getValue(item, normalizedSite.fields.projetista));
 
       return {
         date,
@@ -223,8 +242,8 @@ app.get('/api/config', (_, res) => {
 
 app.get('/api/dashboard', async (req, res) => {
   try {
-    const siteName = req.query.site || config.sites[0].name;
-    const selectedSite = getSiteByName(siteName);
+    const siteName = req.query.site || config.sites[0]?.name || config.sites[0]?.siteName;
+    const selectedSite = normalizeSiteConfig(getSiteByName(siteName));
     const filters = {
       uf: req.query.uf || '',
       cidade: req.query.cidade || '',

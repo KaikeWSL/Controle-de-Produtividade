@@ -1,0 +1,40 @@
+{
+  "sites": [
+    {
+      "name": "Hfc",
+      "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+      "listName": "Visium",
+      "defaultYear": 2026,
+      "fields": {
+        "projetista": "Projetista",
+        "dataConclusao": "Data_x0020_Conclus_x00e3_o",
+        "uf": "Title",
+        "cidade": "Cidade"
+      }
+    },
+    {
+      "name": "Operacional",
+      "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+      "listName": "Operacional",
+      "defaultYear": 2026,
+      "fields": {
+        "projetista": "field_3",
+        "dataConclusao": "field_7",
+        "uf": "Title",
+        "cidade": "field_1"
+      }
+    },
+    {
+      "name": "Migração",
+      "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+      "listName": "MIGRAÇÂO",
+      "defaultYear": 2026,
+      "fields": {
+        "projetista": "COLABORADOR",
+        "dataConclusao": "DATA_x0020_TERMINO",
+        "uf": "UF",
+        "cidade": "Cidade"
+      }
+    }
+  ]
+}
