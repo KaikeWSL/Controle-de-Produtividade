@@ -171,26 +171,33 @@ async function fetchListItems(site, filters = {}) {
   const siteHostname = new URL(siteUrl).hostname;
   const sitePath = new URL(siteUrl).pathname.replace(/\/$/, '');
   const listName = (normalizedSite.listName || '').replace(/\s+/g, ' ').trim();
-  const graphUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=5000`;
+  const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
 
-  const response = await fetch(graphUrl, {
-    headers: {
-      Accept: 'application/json;odata.metadata=none',
-      Authorization: `Bearer ${token}`
+  let nextUrl = baseUrl;
+  const allItems = [];
+
+  while (nextUrl) {
+    const response = await fetch(nextUrl, {
+      headers: {
+        Accept: 'application/json;odata.metadata=none',
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    const payload = await readJsonResponse(response);
+
+    if (!response.ok) {
+      const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
+      const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
+      throw new Error(`Erro ao consultar lista ${normalizedSite.listName}: ${detail}`);
     }
-  });
 
-  const payload = await readJsonResponse(response);
-
-  if (!response.ok) {
-    const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
-    const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
-    throw new Error(`Erro ao consultar lista ${normalizedSite.listName}: ${detail}`);
+    const items = Array.isArray(payload.value) ? payload.value : [];
+    allItems.push(...items);
+    nextUrl = payload['@odata.nextLink'] || null;
   }
 
-  const items = Array.isArray(payload.value) ? payload.value : [];
-
-  return items
+  return allItems
     .map((item) => {
       const fieldData = item.fields || {};
       const dataConclusao = getValue(fieldData, normalizedSite.fields.dataConclusao);
