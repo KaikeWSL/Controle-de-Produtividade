@@ -106,6 +106,25 @@ function safeString(value) {
   return String(value).trim();
 }
 
+async function readJsonResponse(response) {
+  const text = await response.text();
+
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {
+      rawText: text,
+      status: response.status,
+      statusText: response.statusText,
+      contentType: response.headers.get('content-type') || ''
+    };
+  }
+}
+
 async function getSharePointToken(siteUrl) {
   const headers = {
     'Content-Type': 'application/x-www-form-urlencoded'
@@ -151,10 +170,12 @@ async function fetchListItems(site, filters = {}) {
     }
   });
 
-  const payload = await response.json();
+  const payload = await readJsonResponse(response);
 
   if (!response.ok) {
-    throw new Error(`Erro ao consultar lista ${site.listName}: ${payload?.error?.message?.value || 'sem mensagem'}`);
+    const rawText = payload?.rawText || payload?.error?.message?.value || JSON.stringify(payload);
+    const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
+    throw new Error(`Erro ao consultar lista ${site.listName}: ${detail}`);
   }
 
   const items = Array.isArray(payload.value) ? payload.value : payload.d?.results || [];
