@@ -181,6 +181,25 @@ function safeString(value) {
   return String(value).trim();
 }
 
+function isIgnorableProjetistaName(value) {
+  const normalized = safeString(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  return !normalized || [
+    'nao informado',
+    'nao informada',
+    'nao cadastrado',
+    'nao cadastra',
+    'sem projetista',
+    'sem informacao',
+    'n/a',
+    'na',
+    'nao informado ' 
+  ].includes(normalized);
+}
+
 function parseMetricValue(value) {
   if (value === true || value === 1 || value === '1') return 1;
   if (value === false || value === 0 || value === '0') return 0;
@@ -314,6 +333,8 @@ async function fetchListItems(site, filters = {}) {
     nextUrl = payload['@odata.nextLink'] || null;
   }
 
+  let uploadDebugLogged = false;
+
   return allItems
     .map((item) => {
       const fieldData = item.fields || {};
@@ -326,13 +347,19 @@ async function fetchListItems(site, filters = {}) {
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
 
-      if (normalizedSite.fields.uploadVisium && (uploadVisiumRaw === '' || uploadVisiumRaw === undefined || uploadVisiumRaw === null)) {
+      if (
+        !uploadDebugLogged &&
+        normalizedSite.fields.uploadVisium &&
+        (uploadVisiumRaw === '' || uploadVisiumRaw === undefined || uploadVisiumRaw === null)
+      ) {
         console.log('[UploadVisium debug]', {
           listName: normalizedSite.listName,
           fieldName: normalizedSite.fields.uploadVisium,
           sampleKeys: Object.keys(fieldData).slice(0, 10),
-          sampleItem: Object.fromEntries(Object.entries(fieldData).slice(0, 5))
+          sampleItem: Object.fromEntries(Object.entries(fieldData).slice(0, 5)),
+          message: 'Campo configurado, porém vazio no payload real do SharePoint.'
         });
+        uploadDebugLogged = true;
       }
 
       return {
@@ -374,7 +401,7 @@ function buildResult(items, options = {}) {
     const nome = safeString(item.projetista).trim();
     const uploadFlag = Number(item.uploadVisium || 0) > 0 ? 1 : 0;
 
-    if (nome) {
+    if (!isIgnorableProjetistaName(nome)) {
       byProjetista[nome] = (byProjetista[nome] || 0) + 1;
 
       if (includeUploadVisium) {
