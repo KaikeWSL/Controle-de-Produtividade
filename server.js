@@ -419,6 +419,13 @@ app.get('/api/dashboard', async (req, res) => {
     const payload = {
       site: selectedSite,
       filters,
+      items: items.map((item) => ({
+        projetista: item.projetista || '',
+        uf: item.uf || '',
+        cidade: item.cidade || '',
+        uploadVisium: Number(item.uploadVisium || 0),
+        date: item.date ? item.date.toISOString() : null
+      })),
       ...result
     };
 
