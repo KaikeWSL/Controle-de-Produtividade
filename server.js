@@ -41,6 +41,11 @@ function loadConfig() {
 const config = loadConfig();
 const dashboardCache = new Map();
 
+app.use((req, res, next) => {
+  console.log(`[request] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 function buildDashboardCacheKey(siteName, activityName, subActivityName, filters = {}) {
   return JSON.stringify({
     siteName: siteName || '',
@@ -195,8 +200,7 @@ function isIgnorableProjetistaName(value) {
     'sem projetista',
     'sem informacao',
     'n/a',
-    'na',
-    'nao informado ' 
+    'na'
   ].includes(normalized);
 }
 
@@ -315,6 +319,7 @@ async function fetchListItems(site, filters = {}) {
     });
 
     const payload = await readJsonResponse(response);
+    console.log(`[SharePoint] list=${normalizedSite.listName} page=${allItems.length + 1} status=${response.status}`);
 
     if (!response.ok) {
       const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
@@ -335,7 +340,7 @@ async function fetchListItems(site, filters = {}) {
 
   let uploadDebugLogged = false;
 
-  return allItems
+  const mappedItems = allItems
     .map((item) => {
       const fieldData = item.fields || {};
       const dataConclusao = getValue(fieldData, normalizedSite.fields.dataConclusao);
@@ -384,6 +389,9 @@ async function fetchListItems(site, filters = {}) {
 
       return true;
     });
+
+  console.log(`[SharePoint] list=${normalizedSite.listName} loaded=${mappedItems.length} filtered=${mappedItems.length} raw=${allItems.length}`);
+  return mappedItems;
 }
 
 function buildResult(items, options = {}) {
@@ -478,11 +486,15 @@ app.get('/api/dashboard', async (req, res) => {
     const cacheKey = buildDashboardCacheKey(siteName, activityName, subActivityName, filters);
     const shouldRefresh = String(req.query.refresh || '').toLowerCase() === 'true' || String(req.query.refresh || '') === '1';
 
+    console.log(`[dashboard] site=${siteName} activity=${activityName} subactivity=${subActivityName} refresh=${shouldRefresh} filters=${JSON.stringify(filters)}`);
+
     if (!shouldRefresh && dashboardCache.has(cacheKey)) {
+      console.log(`[cache] using cached dashboard for ${cacheKey}`);
       return res.json(dashboardCache.get(cacheKey));
     }
 
     const items = await fetchListItems(selectedSite, filters);
+    console.log(`[dashboard] items received=${items.length} for ${siteName}/${activityName}`);
     const result = buildResult(items, { includeUploadVisium: Boolean(selectedSite?.fields?.uploadVisium) });
     const payload = {
       site: selectedSite,
