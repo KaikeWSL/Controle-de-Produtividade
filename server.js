@@ -133,12 +133,21 @@ function normalizeFieldName(value) {
   return String(value || '').trim();
 }
 
+function normalizeKeyForMatch(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .toLowerCase();
+}
+
 function getValue(item, fieldName) {
   if (!fieldName) return '';
   const key = normalizeFieldName(fieldName);
   if (!key) return '';
 
   const source = item && item.fields ? item.fields : item;
+  const rawKeys = Object.keys(source || {});
   const candidates = new Set([
     key,
     key.replace(/_x0020_/gi, ' '),
@@ -147,7 +156,11 @@ function getValue(item, fieldName) {
     key.replace(/x0020/gi, ' '),
     key.replace(/x0020/gi, ''),
     key.toLowerCase(),
-    key.toUpperCase()
+    key.toUpperCase(),
+    key.replace(/\s+/g, ''),
+    key.replace(/_/g, ''),
+    key.replace(/_/g, '').toLowerCase(),
+    key.replace(/\s+/g, '').toLowerCase()
   ]);
 
   for (const candidate of candidates) {
@@ -155,13 +168,13 @@ function getValue(item, fieldName) {
     if (directValue !== undefined && directValue !== null) return directValue;
   }
 
-  const aliasKey = Object.keys(source || {}).find((candidate) => {
-    const normalizedCandidate = candidate.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-    const normalizedKey = key.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-    return normalizedCandidate === normalizedKey;
+  const matchedKey = rawKeys.find((candidate) => {
+    const normalizedCandidate = normalizeKeyForMatch(candidate);
+    const normalizedKey = normalizeKeyForMatch(key);
+    return normalizedCandidate === normalizedKey || normalizedCandidate.includes(normalizedKey) || normalizedKey.includes(normalizedCandidate);
   });
 
-  if (aliasKey) return source[aliasKey];
+  if (matchedKey) return source[matchedKey];
 
   return '';
 }
@@ -170,9 +183,27 @@ function parseSharePointDate(value) {
   if (!value) return null;
 
   if (typeof value === 'string') {
-    const iso = value.split('T')[0];
-    const parsed = new Date(iso);
-    if (!Number.isNaN(parsed.getTime())) return parsed;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+
+    const candidates = [
+      trimmed.split('T')[0],
+      trimmed.replace(/\//g, '-'),
+      trimmed.replace(/\./g, '-'),
+      trimmed
+    ];
+
+    for (const candidate of candidates) {
+      const parsed = new Date(candidate);
+      if (!Number.isNaN(parsed.getTime())) return parsed;
+    }
+
+    const dmyMatch = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+    if (dmyMatch) {
+      const [, day, month, year] = dmyMatch;
+      const parsed = new Date(`${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`);
+      if (!Number.isNaN(parsed.getTime())) return parsed;
+    }
   }
 
   const parsed = new Date(value);
@@ -379,6 +410,16 @@ async function fetchListItems(site, filters = {}) {
       const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
+
+      if (!date && normalizedSite.fields.dataConclusao) {
+        console.log('[Date debug]', {
+          listName: normalizedSite.listName,
+          fieldName: normalizedSite.fields.dataConclusao,
+          rawValue: dataConclusao,
+          sampleKeys: Object.keys(fieldData).slice(0, 20),
+          sampleItem: Object.fromEntries(Object.entries(fieldData).slice(0, 6))
+        });
+      }
 
       if (
         !uploadDebugLogged &&
