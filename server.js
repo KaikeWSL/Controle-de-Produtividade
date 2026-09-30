@@ -171,15 +171,32 @@ function parseMetricValue(value) {
   if (value === true || value === 1 || value === '1') return 1;
   if (value === false || value === 0 || value === '0') return 0;
 
+  if (Array.isArray(value)) {
+    return value.reduce((sum, item) => sum + parseMetricValue(item), 0);
+  }
+
+  if (value && typeof value === 'object') {
+    if ('Value' in value) return parseMetricValue(value.Value);
+    if ('Label' in value) return parseMetricValue(value.Label);
+    if ('label' in value) return parseMetricValue(value.label);
+    if ('results' in value && Array.isArray(value.results)) {
+      return value.results.reduce((sum, item) => sum + parseMetricValue(item), 0);
+    }
+  }
+
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
   }
 
-  const text = safeString(value).toLowerCase();
+  const text = safeString(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
   if (!text) return 0;
 
-  if (['sim', 'yes', 'true', 'ok', 'uploaded', 'upload', 'concluido', 'concluída'].includes(text)) {
-    return 1;
+  if (['sim', 'yes', 'true', 'ok', 'uploaded', 'upload', 'concluido', 'concluida', 's', 'nao', 'no', 'n'].includes(text)) {
+    return text === 'nao' || text === 'no' || text === 'n' ? 0 : 1;
   }
 
   const normalized = text.replace(/[%.,]/g, '').replace(/\s+/g, '');
@@ -294,7 +311,7 @@ async function fetchListItems(site, filters = {}) {
         : 0;
       const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
-      const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
+      const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista)) || 'Não informado';
 
       return {
         date,
@@ -306,8 +323,6 @@ async function fetchListItems(site, filters = {}) {
       };
     })
     .filter((item) => {
-      if (!item.projetista) return false;
-
       if (filters.projetista && item.projetista.toLowerCase() !== String(filters.projetista).toLowerCase()) return false;
       if (filters.uf && item.uf !== filters.uf) return false;
       if (filters.cidade && item.cidade.toLowerCase() !== String(filters.cidade).toLowerCase()) return false;
@@ -335,10 +350,11 @@ function buildResult(items, options = {}) {
 
   items.forEach((item) => {
     const nome = item.projetista || 'Não informado';
+    const uploadFlag = Number(item.uploadVisium || 0) > 0 ? 1 : 0;
     byProjetista[nome] = (byProjetista[nome] || 0) + 1;
 
     if (includeUploadVisium) {
-      byProjetistaUpload[nome] = (byProjetistaUpload[nome] || 0) + Number(item.uploadVisium || 0);
+      byProjetistaUpload[nome] = (byProjetistaUpload[nome] || 0) + uploadFlag;
     }
 
     projetistas.add(nome);
