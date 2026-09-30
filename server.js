@@ -325,7 +325,7 @@ async function fetchListItems(site, filters = {}) {
         : 0;
       const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
-      const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista)) || 'Não informado';
+      const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
 
       return {
         date,
@@ -337,6 +337,7 @@ async function fetchListItems(site, filters = {}) {
       };
     })
     .filter((item) => {
+      if (!item.projetista || !item.projetista.trim()) return false;
       if (filters.projetista && item.projetista.toLowerCase() !== String(filters.projetista).toLowerCase()) return false;
       if (filters.uf && item.uf !== filters.uf) return false;
       if (filters.cidade && item.cidade.toLowerCase() !== String(filters.cidade).toLowerCase()) return false;
