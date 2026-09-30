@@ -212,6 +212,34 @@ function parseSharePointDate(value) {
   return null;
 }
 
+function getListNameCandidates(listName) {
+  const raw = String(listName || '').replace(/\s+/g, ' ').trim();
+  if (!raw) return [];
+
+  const base = raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const noPunctuation = base.replace(/[^a-zA-Z0-9]/g, '');
+
+  const candidates = new Set([
+    raw,
+    raw.toLowerCase(),
+    raw.toUpperCase(),
+    base,
+    base.toLowerCase(),
+    base.toUpperCase(),
+    base.replace(/\s+/g, ''),
+    base.replace(/\s+/g, '').toLowerCase(),
+    base.replace(/[-_]/g, ' '),
+    base.replace(/[-_]/g, ' ').replace(/\s+/g, ''),
+    noPunctuation,
+    noPunctuation.toLowerCase(),
+    noPunctuation.toUpperCase(),
+    raw.replace(/[-_]/g, ' '),
+    raw.replace(/[-_]/g, ' ').replace(/\s+/g, '')
+  ]);
+
+  return Array.from(candidates).filter(Boolean);
+}
+
 function safeString(value) {
   if (value === undefined || value === null) return '';
   return String(value).trim();
@@ -346,7 +374,7 @@ async function fetchListItems(site, filters = {}) {
   const normalizedSite = normalizeSiteConfig(site);
 
   if (!normalizedSite || !normalizedSite.url || !normalizedSite.listName) {
-    console.warn('Lista de SharePoint não configurada para esta seleção:', site);
+    console.error('[SharePoint] Lista não configurada para a seleção:', site);
     return [];
   }
 
@@ -363,38 +391,58 @@ async function fetchListItems(site, filters = {}) {
 
   const siteHostname = new URL(siteUrl).hostname;
   const sitePath = new URL(siteUrl).pathname.replace(/\/$/, '');
-  const listName = (normalizedSite.listName || '').replace(/\s+/g, ' ').trim();
-  const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
+  const listCandidates = getListNameCandidates(normalizedSite.listName);
+  let activeListName = normalizedSite.listName;
+  let allItems = [];
 
-  let nextUrl = baseUrl;
-  const allItems = [];
+  for (const listName of listCandidates) {
+    const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
+    let nextUrl = baseUrl;
+    const pageItems = [];
 
-  while (nextUrl) {
-    const response = await fetch(nextUrl, {
-      headers: {
-        Accept: 'application/json;odata.metadata=none',
-        Authorization: `Bearer ${token}`
+    while (nextUrl) {
+      const response = await fetch(nextUrl, {
+        headers: {
+          Accept: 'application/json;odata.metadata=none',
+          Authorization: `Bearer ${token}`
+        }
+      });
+
+      const payload = await readJsonResponse(response);
+      console.log(`[SharePoint] list=${listName} page=${pageItems.length + 1} status=${response.status}`);
+
+      if (!response.ok) {
+        const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
+        const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
+
+        if ([400, 401, 403, 404].includes(response.status)) {
+          console.warn(`Lista não encontrada com nome alternativo: ${listName}. Detalhe: ${detail}`);
+          break;
+        }
+
+        throw new Error(`Erro ao consultar lista ${listName}: ${detail}`);
       }
-    });
 
-    const payload = await readJsonResponse(response);
-    console.log(`[SharePoint] list=${normalizedSite.listName} page=${allItems.length + 1} status=${response.status}`);
-
-    if (!response.ok) {
-      const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
-      const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
-
-      if ([400, 401, 403, 404].includes(response.status)) {
-        console.warn(`Lista ignorada por configuração inválida ou inexistente: ${normalizedSite.listName}. Detalhe: ${detail}`);
-        return [];
-      }
-
-      throw new Error(`Erro ao consultar lista ${normalizedSite.listName}: ${detail}`);
+      const items = Array.isArray(payload.value) ? payload.value : [];
+      pageItems.push(...items);
+      nextUrl = payload['@odata.nextLink'] || null;
     }
 
-    const items = Array.isArray(payload.value) ? payload.value : [];
-    allItems.push(...items);
-    nextUrl = payload['@odata.nextLink'] || null;
+    if (pageItems.length > 0) {
+      allItems = pageItems;
+      activeListName = listName;
+      break;
+    }
+  }
+
+  if (!allItems.length && listCandidates.length) {
+    console.error('[SharePoint] Nenhuma lista foi encontrada para a configuração atual.', {
+      site: normalizedSite.name,
+      url: normalizedSite.url,
+      listName: normalizedSite.listName,
+      candidates: listCandidates,
+      attemptedFields: fields
+    });
   }
 
   let uploadDebugLogged = false;
@@ -412,12 +460,22 @@ async function fetchListItems(site, filters = {}) {
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
 
       if (!date && normalizedSite.fields.dataConclusao) {
-        console.log('[Date debug]', {
+        console.warn('[SharePoint] Coluna de data não reconhecida ou vazia.', {
           listName: normalizedSite.listName,
           fieldName: normalizedSite.fields.dataConclusao,
           rawValue: dataConclusao,
           sampleKeys: Object.keys(fieldData).slice(0, 20),
           sampleItem: Object.fromEntries(Object.entries(fieldData).slice(0, 6))
+        });
+      }
+
+      if (
+        !normalizedSite.fields.dataConclusao &&
+        !normalizedSite.fields.projetista
+      ) {
+        console.error('[SharePoint] Colunas obrigatórias ausentes para a atividade.', {
+          listName: normalizedSite.listName,
+          fields: normalizedSite.fields
         });
       }
 
