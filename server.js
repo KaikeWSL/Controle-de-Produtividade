@@ -204,6 +204,34 @@ function isIgnorableProjetistaName(value) {
   ].includes(normalized);
 }
 
+function isDateLikeValue(value) {
+  if (value === undefined || value === null || value === '') return false;
+
+  if (value instanceof Date) {
+    return !Number.isNaN(value.getTime());
+  }
+
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return false;
+    return /\d{4}-\d{2}-\d{2}/.test(text) || /\d{2}\/\d{2}\/\d{4}/.test(text) || /\d{4}-\d{2}-\d{2}T/.test(text);
+  }
+
+  return false;
+}
+
+function normalizeUploadValue(value) {
+  if (value === true || value === 1 || value === '1') return 1;
+  if (value === false || value === 0 || value === '0') return 0;
+
+  if (isDateLikeValue(value)) {
+    return 1;
+  }
+
+  const numericValue = parseMetricValue(value);
+  return numericValue > 0 ? 1 : 0;
+}
+
 function parseMetricValue(value) {
   if (value === true || value === 1 || value === '1') return 1;
   if (value === false || value === 0 || value === '0') return 0;
@@ -347,7 +375,7 @@ async function fetchListItems(site, filters = {}) {
       const date = parseSharePointDate(dataConclusao);
       const hasUploadVisiumField = Boolean(normalizedSite.fields.uploadVisium);
       const uploadVisiumRaw = hasUploadVisiumField ? getValue(fieldData, normalizedSite.fields.uploadVisium) : '';
-      const uploadVisium = hasUploadVisiumField ? parseMetricValue(uploadVisiumRaw) : 0;
+      const uploadVisium = hasUploadVisiumField ? normalizeUploadValue(uploadVisiumRaw) : 0;
       const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
