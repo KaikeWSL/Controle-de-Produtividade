@@ -30,7 +30,7 @@
         {
           "name": "Migração",
           "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
-          "listName": "MIGRAÇÂO",
+          "listName": "MIGRAO",
           "defaultYear": 2026,
           "fields": {
             "projetista": "COLABORADOR",
@@ -113,7 +113,7 @@
             {
               "name": "Revisões",
               "url": "https://corpclarobr.sharepoint.com/sites/USER-Treinamentos-EquipeInterligao",
-              "listName": "Revisoes",
+              "listName": "Revises",
               "defaultYear": 2026,
               "fields": {
                 "projetista": "RESPONS_x00c1_VEL",
