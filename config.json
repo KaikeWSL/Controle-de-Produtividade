@@ -31,7 +31,7 @@
         {
           "name": "Migração",
           "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
-          "listName": "MIGRAO",
+          "listName": "MIGRACAO",
           "defaultYear": 2026,
           "fields": {
             "projetista": "COLABORADOR",
