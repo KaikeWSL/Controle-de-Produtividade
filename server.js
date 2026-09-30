@@ -288,7 +288,10 @@ async function fetchListItems(site, filters = {}) {
       const fieldData = item.fields || {};
       const dataConclusao = getValue(fieldData, normalizedSite.fields.dataConclusao);
       const date = parseSharePointDate(dataConclusao);
-      const uploadVisium = parseMetricValue(getValue(fieldData, normalizedSite.fields.uploadVisium));
+      const hasUploadVisiumField = Boolean(normalizedSite.fields.uploadVisium);
+      const uploadVisium = hasUploadVisiumField
+        ? parseMetricValue(getValue(fieldData, normalizedSite.fields.uploadVisium))
+        : 0;
       const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
@@ -319,7 +322,8 @@ async function fetchListItems(site, filters = {}) {
     });
 }
 
-function buildResult(items) {
+function buildResult(items, options = {}) {
+  const includeUploadVisium = Boolean(options.includeUploadVisium);
   const byProjetista = {};
   const byProjetistaUpload = {};
   const byMonth = Array.from({ length: 12 }, (_, idx) => ({ month: idx + 1, label: monthNames[idx], total: 0 }));
@@ -332,7 +336,11 @@ function buildResult(items) {
   items.forEach((item) => {
     const nome = item.projetista || 'Não informado';
     byProjetista[nome] = (byProjetista[nome] || 0) + 1;
-    byProjetistaUpload[nome] = (byProjetistaUpload[nome] || 0) + Number(item.uploadVisium || 0);
+
+    if (includeUploadVisium) {
+      byProjetistaUpload[nome] = (byProjetistaUpload[nome] || 0) + Number(item.uploadVisium || 0);
+    }
+
     projetistas.add(nome);
 
     if (item.date) {
@@ -345,14 +353,19 @@ function buildResult(items) {
     if (item.cidade) cidades.add(item.cidade);
   });
 
+  const uploadVisiumTotal = includeUploadVisium
+    ? Object.values(byProjetistaUpload).reduce((sum, value) => sum + Number(value || 0), 0)
+    : 0;
+
   const barData = Object.entries(byProjetista)
-    .map(([label, total]) => ({ label, total, upload: byProjetistaUpload[label] || 0 }))
+    .map(([label, total]) => ({ label, total, upload: includeUploadVisium ? (byProjetistaUpload[label] || 0) : 0 }))
     .sort((a, b) => b.total - a.total)
     .slice(0, 15);
 
   const summary = {
     total: items.length,
     done: doneCount,
+    uploadVisiumTotal,
     uniqueProjetistas: Object.keys(byProjetista).length,
     anoInicial: Math.min(...Array.from(years), 0) || new Date().getFullYear(),
     anoFinal: Math.max(...Array.from(years), new Date().getFullYear())
@@ -365,7 +378,8 @@ function buildResult(items) {
     years: Array.from(years).sort((a, b) => a - b),
     ufs: Array.from(ufs).sort(),
     cidades: Array.from(cidades).sort((a, b) => a.localeCompare(b)),
-    projetistas: Array.from(projetistas).sort((a, b) => a.localeCompare(b))
+    projetistas: Array.from(projetistas).sort((a, b) => a.localeCompare(b)),
+    includeUploadVisium
   };
 }
 
@@ -401,7 +415,7 @@ app.get('/api/dashboard', async (req, res) => {
     }
 
     const items = await fetchListItems(selectedSite, filters);
-    const result = buildResult(items);
+    const result = buildResult(items, { includeUploadVisium: Boolean(selectedSite?.fields?.uploadVisium) });
     const payload = {
       site: selectedSite,
       filters,
