@@ -194,6 +194,12 @@ async function getGraphToken() {
 
 async function fetchListItems(site, filters = {}) {
   const normalizedSite = normalizeSiteConfig(site);
+
+  if (!normalizedSite || !normalizedSite.url || !normalizedSite.listName) {
+    console.warn('Lista de SharePoint não configurada para esta seleção:', site);
+    return [];
+  }
+
   const siteUrl = normalizedSite.url;
   const token = await getGraphToken();
 
@@ -225,6 +231,12 @@ async function fetchListItems(site, filters = {}) {
     if (!response.ok) {
       const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
       const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
+
+      if ([400, 401, 403, 404].includes(response.status)) {
+        console.warn(`Lista ignorada por configuração inválida ou inexistente: ${normalizedSite.listName}. Detalhe: ${detail}`);
+        return [];
+      }
+
       throw new Error(`Erro ao consultar lista ${normalizedSite.listName}: ${detail}`);
     }
 
