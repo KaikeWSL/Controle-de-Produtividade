@@ -53,6 +53,41 @@ function getSiteByName(name) {
   return config.sites.find((site) => (site.name || site.siteName) === name) || config.sites[0];
 }
 
+function resolveSelectedSite(siteName, activityName, subActivityName) {
+  const site = getSiteByName(siteName);
+  if (!site) return null;
+
+  if (Array.isArray(site.activities) && site.activities.length) {
+    const selectedActivity = site.activities.find((activity) => (activity.name || activity.activityName) === activityName)
+      || site.activities[0];
+
+    if (Array.isArray(selectedActivity?.activities) && selectedActivity.activities.length) {
+      const selectedSubActivity = selectedActivity.activities.find((activity) => (activity.name || activity.activityName) === subActivityName)
+        || selectedActivity.activities[0];
+
+      return normalizeSiteConfig({
+        ...site,
+        ...selectedActivity,
+        ...selectedSubActivity,
+        name: site.name,
+        activityName: selectedActivity.name || selectedActivity.activityName || '',
+        subActivityName: selectedSubActivity.name || selectedSubActivity.activityName || '',
+        activities: site.activities
+      });
+    }
+
+    return normalizeSiteConfig({
+      ...site,
+      ...selectedActivity,
+      name: site.name,
+      activityName: selectedActivity.name || selectedActivity.activityName || '',
+      activities: site.activities
+    });
+  }
+
+  return normalizeSiteConfig(site);
+}
+
 function normalizeSiteConfig(site) {
   if (!site) return null;
 
@@ -61,6 +96,7 @@ function normalizeSiteConfig(site) {
     name: site.name || site.siteName || 'Site',
     url: site.url || site.siteUrl || '',
     listName: site.listName || site.listTitle || site.title || '',
+    activityName: site.activityName || site.name || '',
     fields: {
       ...site.fields,
       projetista: site.fields?.projetista || site.fields?.project || '',
@@ -286,7 +322,9 @@ app.get('/api/config', (_, res) => {
 app.get('/api/dashboard', async (req, res) => {
   try {
     const siteName = req.query.site || config.sites[0]?.name || config.sites[0]?.siteName;
-    const selectedSite = normalizeSiteConfig(getSiteByName(siteName));
+    const activityName = req.query.activity || '';
+    const subActivityName = req.query.subactivity || '';
+    const selectedSite = resolveSelectedSite(siteName, activityName, subActivityName);
     const filters = {
       projetista: req.query.projetista || '',
       uf: req.query.uf || '',

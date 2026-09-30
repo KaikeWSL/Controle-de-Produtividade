@@ -2,39 +2,153 @@
   "sites": [
     {
       "name": "Hfc",
-      "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
-      "listName": "Visium",
-      "defaultYear": 2026,
-      "fields": {
-        "projetista": "Projetista",
-        "dataConclusao": "Data_x0020_Conclus_x00e3_o",
-        "uf": "Title",
-        "cidade": "Cidade"
-      }
+      "activities": [
+        {
+          "name": "Visium",
+          "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+          "listName": "Visium",
+          "defaultYear": 2026,
+          "fields": {
+            "projetista": "Projetista",
+            "dataConclusao": "Data_x0020_Conclus_x00e3_o",
+            "uf": "Title",
+            "cidade": "Cidade"
+          }
+        },
+        {
+          "name": "Operacional",
+          "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+          "listName": "Operacional",
+          "defaultYear": 2026,
+          "fields": {
+            "projetista": "field_3",
+            "dataConclusao": "field_7",
+            "uf": "Title",
+            "cidade": "field_1"
+          }
+        },
+        {
+          "name": "Migração",
+          "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+          "listName": "MIGRAÇÂO",
+          "defaultYear": 2026,
+          "fields": {
+            "projetista": "COLABORADOR",
+            "dataConclusao": "DATA_x0020_TERMINO"
+          }
+        },
+        {
+          "name": "KMZ",
+          "activities": [
+            {
+              "name": "GRID",
+              "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+              "listName": "KMZ",
+              "defaultYear": 2026,
+              "fields": {
+                "projetista": "Projetista_x0020_GRID",
+                "dataConclusao": "Data_x0020_GRID",
+                "uf": "Title",
+                "cidade": "Cidade"
+              }
+            },
+            {
+              "name": "DXF",
+              "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+              "listName": "KMZ",
+              "defaultYear": 2026,
+              "fields": {
+                "projetista": "Projetista_x0020_DXF",
+                "dataConclusao": "Data_x0020_DXF",
+                "uf": "Title",
+                "cidade": "Cidade"
+              }
+            },
+            {
+              "name": "Kmz",
+              "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
+              "listName": "KMZ",
+              "defaultYear": 2026,
+              "fields": {
+                "projetista": "Projetista_x0020_KMZ",
+                "dataConclusao": "Data_x0020_KMZ",
+                "uf": "Title",
+                "cidade": "Cidade"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
-      "name": "Operacional",
-      "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
-      "listName": "Operacional",
-      "defaultYear": 2026,
-      "fields": {
-        "projetista": "field_3",
-        "dataConclusao": "field_7",
-        "uf": "Title",
-        "cidade": "field_1"
-      }
-    },
-    {
-      "name": "Migração",
-      "url": "https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia",
-      "listName": "MIGRAÇÂO",
-      "defaultYear": 2026,
-      "fields": {
-        "projetista": "COLABORADOR",
-        "dataConclusao": "DATA_x0020_TERMINO",
-        "uf": "UF",
-        "cidade": "Cidade"
-      }
+      "name": "Gpon",
+      "activities": [
+        {
+          "name": "Sar Fo",
+          "url": "https://corpclarobr.sharepoint.com/sites/USER-PROJETOSOPTICOS",
+          "listName": "Controle",
+          "defaultYear": 2026,
+          "fields": {
+            "projetista": "RESPONSAVEL",
+            "dataConclusao": "TÉRMINO",
+            "uf": "UF",
+            "cidade": "CIDADE"
+          }
+        },
+        {
+          "name": "Interligação",
+          "activities": [
+            {
+              "name": "Projetos",
+              "url": "https://corpclarobr.sharepoint.com/sites/USER-Treinamentos-EquipeInterligao",
+              "listName": "Projetos",
+              "defaultYear": 2026,
+              "fields": {
+                "projetista": "RESPONS_x00c1_VEL",
+                "dataConclusao": "ENVIO",
+                "uf": "UF",
+                "cidade": "CIDADE"
+              }
+            },
+            {
+              "name": "Revisões",
+              "url": "https://corpclarobr.sharepoint.com/sites/USER-Treinamentos-EquipeInterligao",
+              "listName": "Revisoes",
+              "defaultYear": 2026,
+              "fields": {
+                "projetista": "RESPONS_x00c1_VEL",
+                "dataConclusao": "ENVIO",
+                "uf": "UF",
+                "cidade": "CIDADE"
+              }
+            },
+            {
+              "name": "As-Built",
+              "url": "https://corpclarobr.sharepoint.com/sites/USER-Treinamentos-EquipeInterligao",
+              "listName": "AsBuilt",
+              "defaultYear": 2026,
+              "fields": {
+                "projetista": "PROJETISTA",
+                "dataConclusao": "CONCLUS_x00c3_O",
+                "uf": "UF",
+                "cidade": "CIDADE"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Inventário",
+          "url": "https://corpclarobr.sharepoint.com/sites/USER-Treinamentos-EquipeInterligao",
+          "listName": "Inventario_Gpon",
+          "defaultYear": 2026,
+          "fields": {
+            "projetista": "Projetista",
+            "dataConclusao": "Data_termino",
+            "uf": "UF",
+            "cidade": "Cidade"
+          }
+        }
+      ]
     }
   ]
 }
