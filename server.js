@@ -320,12 +320,20 @@ async function fetchListItems(site, filters = {}) {
       const dataConclusao = getValue(fieldData, normalizedSite.fields.dataConclusao);
       const date = parseSharePointDate(dataConclusao);
       const hasUploadVisiumField = Boolean(normalizedSite.fields.uploadVisium);
-      const uploadVisium = hasUploadVisiumField
-        ? parseMetricValue(getValue(fieldData, normalizedSite.fields.uploadVisium))
-        : 0;
+      const uploadVisiumRaw = hasUploadVisiumField ? getValue(fieldData, normalizedSite.fields.uploadVisium) : '';
+      const uploadVisium = hasUploadVisiumField ? parseMetricValue(uploadVisiumRaw) : 0;
       const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
+
+      if (normalizedSite.fields.uploadVisium && (uploadVisiumRaw === '' || uploadVisiumRaw === undefined || uploadVisiumRaw === null)) {
+        console.log('[UploadVisium debug]', {
+          listName: normalizedSite.listName,
+          fieldName: normalizedSite.fields.uploadVisium,
+          sampleKeys: Object.keys(fieldData).slice(0, 10),
+          sampleItem: Object.fromEntries(Object.entries(fieldData).slice(0, 5))
+        });
+      }
 
       return {
         date,
@@ -337,10 +345,9 @@ async function fetchListItems(site, filters = {}) {
       };
     })
     .filter((item) => {
-      if (!item.projetista || !item.projetista.trim()) return false;
-      if (filters.projetista && item.projetista.toLowerCase() !== String(filters.projetista).toLowerCase()) return false;
+      if (filters.projetista && String(item.projetista || '').toLowerCase() !== String(filters.projetista).toLowerCase()) return false;
       if (filters.uf && item.uf !== filters.uf) return false;
-      if (filters.cidade && item.cidade.toLowerCase() !== String(filters.cidade).toLowerCase()) return false;
+      if (filters.cidade && String(item.cidade || '').toLowerCase() !== String(filters.cidade).toLowerCase()) return false;
       if (item.date) {
         if (filters.ano && item.date.getFullYear() !== Number(filters.ano)) return false;
         if (filters.mes && item.date.getMonth() + 1 !== Number(filters.mes)) return false;
@@ -388,7 +395,7 @@ function buildResult(items, options = {}) {
   });
 
   const uploadVisiumTotal = includeUploadVisium
-    ? Object.values(byProjetistaUpload).reduce((sum, value) => sum + Number(value || 0), 0)
+    ? items.filter((item) => Number(item.uploadVisium || 0) > 0).length
     : 0;
 
   const barData = Object.entries(byProjetista)
