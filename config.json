@@ -11,6 +11,7 @@
           "fields": {
             "projetista": "Projetista",
             "dataConclusao": "Data_x0020_Conclus_x00e3_o",
+            "uploadVisium": "Upload_x0020_Visium",
             "uf": "Title",
             "cidade": "Cidade"
           }

@@ -39,6 +39,22 @@ function loadConfig() {
 }
 
 const config = loadConfig();
+const dashboardCache = new Map();
+
+function buildDashboardCacheKey(siteName, activityName, subActivityName, filters = {}) {
+  return JSON.stringify({
+    siteName: siteName || '',
+    activityName: activityName || '',
+    subActivityName: subActivityName || '',
+    filters: {
+      projetista: filters.projetista || '',
+      uf: filters.uf || '',
+      cidade: filters.cidade || '',
+      mes: filters.mes || '',
+      ano: filters.ano || ''
+    }
+  });
+}
 
 app.use(cors({
   origin: true,
@@ -101,6 +117,7 @@ function normalizeSiteConfig(site) {
       ...site.fields,
       projetista: site.fields?.projetista || site.fields?.project || '',
       dataConclusao: site.fields?.dataConclusao || site.fields?.dateConclusion || '',
+      uploadVisium: site.fields?.uploadVisium || site.fields?.uploadVisiumField || '',
       uf: site.fields?.uf || site.fields?.state || '',
       cidade: site.fields?.cidade || site.fields?.city || ''
     }
@@ -148,6 +165,26 @@ function parseSharePointDate(value) {
 function safeString(value) {
   if (value === undefined || value === null) return '';
   return String(value).trim();
+}
+
+function parseMetricValue(value) {
+  if (value === true || value === 1 || value === '1') return 1;
+  if (value === false || value === 0 || value === '0') return 0;
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  const text = safeString(value).toLowerCase();
+  if (!text) return 0;
+
+  if (['sim', 'yes', 'true', 'ok', 'uploaded', 'upload', 'concluido', 'concluída'].includes(text)) {
+    return 1;
+  }
+
+  const normalized = text.replace(/[%.,]/g, '').replace(/\s+/g, '');
+  const numeric = Number(normalized);
+  return Number.isFinite(numeric) ? numeric : 0;
 }
 
 async function readJsonResponse(response) {
@@ -206,6 +243,7 @@ async function fetchListItems(site, filters = {}) {
   const fields = [
     normalizedSite.fields.projetista,
     normalizedSite.fields.dataConclusao,
+    normalizedSite.fields.uploadVisium,
     normalizedSite.fields.uf,
     normalizedSite.fields.cidade
   ].filter(Boolean);
@@ -250,12 +288,14 @@ async function fetchListItems(site, filters = {}) {
       const fieldData = item.fields || {};
       const dataConclusao = getValue(fieldData, normalizedSite.fields.dataConclusao);
       const date = parseSharePointDate(dataConclusao);
+      const uploadVisium = parseMetricValue(getValue(fieldData, normalizedSite.fields.uploadVisium));
       const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
 
       return {
         date,
+        uploadVisium,
         uf,
         cidade,
         projetista,
@@ -263,13 +303,17 @@ async function fetchListItems(site, filters = {}) {
       };
     })
     .filter((item) => {
-      if (!item.projetista || !item.date) return false;
+      if (!item.projetista) return false;
 
       if (filters.projetista && item.projetista.toLowerCase() !== String(filters.projetista).toLowerCase()) return false;
       if (filters.uf && item.uf !== filters.uf) return false;
       if (filters.cidade && item.cidade.toLowerCase() !== String(filters.cidade).toLowerCase()) return false;
-      if (filters.ano && item.date.getFullYear() !== Number(filters.ano)) return false;
-      if (filters.mes && item.date.getMonth() + 1 !== Number(filters.mes)) return false;
+      if (item.date) {
+        if (filters.ano && item.date.getFullYear() !== Number(filters.ano)) return false;
+        if (filters.mes && item.date.getMonth() + 1 !== Number(filters.mes)) return false;
+      } else if (filters.ano || filters.mes) {
+        return false;
+      }
 
       return true;
     });
@@ -277,15 +321,18 @@ async function fetchListItems(site, filters = {}) {
 
 function buildResult(items) {
   const byProjetista = {};
+  const byProjetistaUpload = {};
   const byMonth = Array.from({ length: 12 }, (_, idx) => ({ month: idx + 1, label: monthNames[idx], total: 0 }));
   const years = new Set();
   const ufs = new Set();
   const cidades = new Set();
   const projetistas = new Set();
+  const doneCount = items.filter((item) => item.date).length;
 
   items.forEach((item) => {
     const nome = item.projetista || 'Não informado';
     byProjetista[nome] = (byProjetista[nome] || 0) + 1;
+    byProjetistaUpload[nome] = (byProjetistaUpload[nome] || 0) + Number(item.uploadVisium || 0);
     projetistas.add(nome);
 
     if (item.date) {
@@ -299,12 +346,13 @@ function buildResult(items) {
   });
 
   const barData = Object.entries(byProjetista)
-    .map(([label, total]) => ({ label, total }))
+    .map(([label, total]) => ({ label, total, upload: byProjetistaUpload[label] || 0 }))
     .sort((a, b) => b.total - a.total)
     .slice(0, 15);
 
   const summary = {
     total: items.length,
+    done: doneCount,
     uniqueProjetistas: Object.keys(byProjetista).length,
     anoInicial: Math.min(...Array.from(years), 0) || new Date().getFullYear(),
     anoFinal: Math.max(...Array.from(years), new Date().getFullYear())
@@ -345,14 +393,23 @@ app.get('/api/dashboard', async (req, res) => {
       ano: req.query.ano || ''
     };
 
+    const cacheKey = buildDashboardCacheKey(siteName, activityName, subActivityName, filters);
+    const shouldRefresh = String(req.query.refresh || '').toLowerCase() === 'true' || String(req.query.refresh || '') === '1';
+
+    if (!shouldRefresh && dashboardCache.has(cacheKey)) {
+      return res.json(dashboardCache.get(cacheKey));
+    }
+
     const items = await fetchListItems(selectedSite, filters);
     const result = buildResult(items);
-
-    res.json({
+    const payload = {
       site: selectedSite,
       filters,
       ...result
-    });
+    };
+
+    dashboardCache.set(cacheKey, payload);
+    res.json(payload);
   } catch (error) {
     console.error(error);
     res.status(500).json({
