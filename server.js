@@ -233,26 +233,35 @@ function getListNameCandidates(listName) {
   const raw = String(listName || '').replace(/\s+/g, ' ').trim();
   if (!raw) return [];
 
-  const base = raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  const noPunctuation = base.replace(/[^a-zA-Z0-9]/g, '');
-
-  const candidates = new Set([
+  const withoutAccents = raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const spaced = withoutAccents.replace(/([a-z])([A-Z])/g, '$1 $2');
+  const splitVariants = [
     raw,
-    raw.toLowerCase(),
-    raw.toUpperCase(),
-    base,
-    base.toLowerCase(),
-    base.toUpperCase(),
-    base.replace(/\s+/g, ''),
-    base.replace(/\s+/g, '').toLowerCase(),
-    base.replace(/[-_]/g, ' '),
-    base.replace(/[-_]/g, ' ').replace(/\s+/g, ''),
-    noPunctuation,
-    noPunctuation.toLowerCase(),
-    noPunctuation.toUpperCase(),
-    raw.replace(/[-_]/g, ' '),
-    raw.replace(/[-_]/g, ' ').replace(/\s+/g, '')
-  ]);
+    withoutAccents,
+    spaced,
+    spaced.replace(/[-_]/g, ' '),
+    spaced.replace(/[-_]/g, ' ').replace(/\s+/g, ''),
+    spaced.replace(/\s+/g, '-'),
+    spaced.replace(/\s+/g, '_'),
+    spaced.replace(/\s+/g, '')
+  ];
+
+  const candidates = new Set();
+
+  splitVariants.forEach((value) => {
+    if (!value) return;
+    candidates.add(value);
+    candidates.add(value.toLowerCase());
+    candidates.add(value.toUpperCase());
+    candidates.add(value.replace(/\s+/g, ''));
+    candidates.add(value.replace(/\s+/g, '').toLowerCase());
+    candidates.add(value.replace(/\s+/g, '').toUpperCase());
+    candidates.add(value.replace(/[-_\s]+/g, ''));
+    candidates.add(value.replace(/[-_\s]+/g, '').toLowerCase());
+    candidates.add(value.replace(/[-_\s]+/g, ' ').trim());
+    candidates.add(value.replace(/[-_\s]+/g, '-').trim());
+    candidates.add(value.replace(/[-_\s]+/g, '_').trim());
+  });
 
   return Array.from(candidates).filter(Boolean);
 }
