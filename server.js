@@ -134,14 +134,28 @@ function getValue(item, fieldName) {
   if (!key) return '';
 
   const source = item && item.fields ? item.fields : item;
+  const candidates = new Set([
+    key,
+    key.replace(/_x0020_/gi, ' '),
+    key.replace(/_x0020_/gi, ''),
+    key.replace(/_/g, ' '),
+    key.replace(/x0020/gi, ' '),
+    key.replace(/x0020/gi, ''),
+    key.toLowerCase(),
+    key.toUpperCase()
+  ]);
 
-  const directValue = source[key];
-  if (directValue !== undefined && directValue !== null) return directValue;
+  for (const candidate of candidates) {
+    const directValue = source[candidate];
+    if (directValue !== undefined && directValue !== null) return directValue;
+  }
 
-  const fallback = source[`${key}`.replace(/_/g, 'x0020')];
-  if (fallback !== undefined && fallback !== null) return fallback;
+  const aliasKey = Object.keys(source || {}).find((candidate) => {
+    const normalizedCandidate = candidate.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    const normalizedKey = key.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    return normalizedCandidate === normalizedKey;
+  });
 
-  const aliasKey = Object.keys(source || {}).find((candidate) => candidate.toLowerCase() === key.toLowerCase());
   if (aliasKey) return source[aliasKey];
 
   return '';
@@ -349,15 +363,18 @@ function buildResult(items, options = {}) {
   const doneCount = items.filter((item) => item.date).length;
 
   items.forEach((item) => {
-    const nome = item.projetista || 'Não informado';
+    const nome = safeString(item.projetista).trim();
     const uploadFlag = Number(item.uploadVisium || 0) > 0 ? 1 : 0;
-    byProjetista[nome] = (byProjetista[nome] || 0) + 1;
 
-    if (includeUploadVisium) {
-      byProjetistaUpload[nome] = (byProjetistaUpload[nome] || 0) + uploadFlag;
+    if (nome) {
+      byProjetista[nome] = (byProjetista[nome] || 0) + 1;
+
+      if (includeUploadVisium) {
+        byProjetistaUpload[nome] = (byProjetistaUpload[nome] || 0) + uploadFlag;
+      }
+
+      projetistas.add(nome);
     }
-
-    projetistas.add(nome);
 
     if (item.date) {
       const monthIndex = item.date.getMonth();
