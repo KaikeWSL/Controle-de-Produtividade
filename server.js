@@ -133,8 +133,18 @@ function normalizeFieldName(value) {
   return String(value || '').trim();
 }
 
-function normalizeKeyForMatch(value) {
+function decodeSharePointFieldName(value) {
   return String(value || '')
+    .replace(/_x([0-9A-Fa-f]{2,4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/x([0-9A-Fa-f]{2,4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/_x([0-9A-Fa-f]{2,4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/_x([0-9A-Fa-f]{2,4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+function normalizeKeyForMatch(value) {
+  const decoded = decodeSharePointFieldName(value);
+
+  return decoded
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-zA-Z0-9]/g, '')
@@ -148,8 +158,11 @@ function getValue(item, fieldName) {
 
   const source = item && item.fields ? item.fields : item;
   const rawKeys = Object.keys(source || {});
+  const normalizedKey = decodeSharePointFieldName(key);
+
   const candidates = new Set([
     key,
+    normalizedKey,
     key.replace(/_x0020_/gi, ' '),
     key.replace(/_x0020_/gi, ''),
     key.replace(/_/g, ' '),
@@ -160,7 +173,11 @@ function getValue(item, fieldName) {
     key.replace(/\s+/g, ''),
     key.replace(/_/g, ''),
     key.replace(/_/g, '').toLowerCase(),
-    key.replace(/\s+/g, '').toLowerCase()
+    key.replace(/\s+/g, '').toLowerCase(),
+    normalizedKey.replace(/\s+/g, ''),
+    normalizedKey.replace(/\s+/g, '').toLowerCase(),
+    decodeSharePointFieldName(key).replace(/_/g, ' '),
+    decodeSharePointFieldName(key).replace(/_/g, '')
   ]);
 
   for (const candidate of candidates) {
@@ -459,9 +476,13 @@ async function fetchListItems(site, filters = {}) {
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
 
-      if (!date && normalizedSite.fields.dataConclusao) {
+      const shouldLogProblemActivity = ['Migração', 'MIGRAO', 'Sar Fo', 'Revisões', 'Revises', 'As-Built', 'AsBuilt'].includes(normalizedSite.activityName || normalizedSite.name || '')
+        || ['Migração', 'MIGRAO', 'Sar Fo', 'Revisões', 'Revises', 'As-Built', 'AsBuilt'].includes(normalizedSite.listName || '');
+
+      if (!date && normalizedSite.fields.dataConclusao && shouldLogProblemActivity) {
         console.warn('[SharePoint] Coluna de data não reconhecida ou vazia.', {
           listName: normalizedSite.listName,
+          activityName: normalizedSite.activityName || normalizedSite.name,
           fieldName: normalizedSite.fields.dataConclusao,
           rawValue: dataConclusao,
           sampleKeys: Object.keys(fieldData).slice(0, 20),
@@ -471,10 +492,12 @@ async function fetchListItems(site, filters = {}) {
 
       if (
         !normalizedSite.fields.dataConclusao &&
-        !normalizedSite.fields.projetista
+        !normalizedSite.fields.projetista &&
+        shouldLogProblemActivity
       ) {
         console.error('[SharePoint] Colunas obrigatórias ausentes para a atividade.', {
           listName: normalizedSite.listName,
+          activityName: normalizedSite.activityName || normalizedSite.name,
           fields: normalizedSite.fields
         });
       }
