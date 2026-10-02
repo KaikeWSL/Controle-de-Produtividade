@@ -52,10 +52,22 @@ const config = loadConfig();
 const dashboardCache = new Map();
 const weightSourceCache = new Map();
 const sourceListCache = new Map();
+const sourceProfileCache = new Map();
 const analyticsCache = new Map();
 const sourceLoadPromises = new Map();
+const sourceProfilePromises = new Map();
+const weightLoadPromises = new Map();
 const requestBuckets = new Map();
-const cacheMetrics = { hits: 0, misses: 0, graphFetches: 0, tokenRefreshes: 0 };
+const dashboardCacheMaxEntries = Math.max(10, Number(process.env.DASHBOARD_CACHE_MAX_ENTRIES) || 30);
+const cacheMetrics = {
+  hits: 0,
+  misses: 0,
+  graphFetches: 0,
+  tokenRefreshes: 0,
+  sourceLoadDeduplications: 0,
+  profileLoadDeduplications: 0,
+  weightLoadDeduplications: 0
+};
 let graphTokenCache = null;
 let graphTokenPromise = null;
 
@@ -134,8 +146,27 @@ function buildDashboardCacheKey(siteName, activityName, subActivityName, filters
   });
 }
 
-function buildSourceCacheKey(site) {
-  return JSON.stringify({ url: site.url, listName: site.listName, fields: site.fields });
+function buildPhysicalSourceCacheKey(site) {
+  const sourceUrl = new URL(site.url);
+  return JSON.stringify({
+    origin: sourceUrl.origin.toLowerCase(),
+    path: sourceUrl.pathname.replace(/\/+$/, '').toLowerCase(),
+    listName: String(site.listName || '').trim().toLowerCase()
+  });
+}
+
+function buildSourceProfileCacheKey(site) {
+  return JSON.stringify({
+    source: buildPhysicalSourceCacheKey(site),
+    fields: {
+      projetista: site.fields?.projetista || '',
+      dataConclusao: site.fields?.dataConclusao || '',
+      uploadVisium: site.fields?.uploadVisium || '',
+      uf: site.fields?.uf || '',
+      cidade: site.fields?.cidade || ''
+    },
+    weightSource: site.weightSource || null
+  });
 }
 
 function getCacheFilePath(cacheKey) {
@@ -156,13 +187,40 @@ function totalSourceItems() {
   return total;
 }
 
+function totalProfileItems() {
+  let total = 0;
+  for (const entry of sourceProfileCache.values()) total += entry.items.length;
+  return total;
+}
+
+function totalCachedItems() {
+  return totalSourceItems() + totalProfileItems();
+}
+
+function removeProfilesForSource(sourceCacheKey) {
+  for (const [profileCacheKey, profile] of sourceProfileCache) {
+    if (profile.sourceCacheKey === sourceCacheKey) sourceProfileCache.delete(profileCacheKey);
+  }
+}
+
+function removeSourceSnapshot(sourceCacheKey) {
+  sourceListCache.delete(sourceCacheKey);
+  removeProfilesForSource(sourceCacheKey);
+}
+
 function evictSourceCache() {
   const now = Date.now();
   for (const [key, entry] of sourceListCache) {
-    if (entry.expiresAt <= now) sourceListCache.delete(key);
+    if (entry.expiresAt <= now) removeSourceSnapshot(key);
   }
-  while (totalSourceItems() > cacheMaxItems && sourceListCache.size) {
-    sourceListCache.delete(sourceListCache.keys().next().value);
+  for (const [key, entry] of sourceProfileCache) {
+    if (entry.expiresAt <= now) sourceProfileCache.delete(key);
+  }
+  while (totalCachedItems() > cacheMaxItems && sourceProfileCache.size) {
+    sourceProfileCache.delete(sourceProfileCache.keys().next().value);
+  }
+  while (totalCachedItems() > cacheMaxItems && sourceListCache.size) {
+    removeSourceSnapshot(sourceListCache.keys().next().value);
   }
 }
 
@@ -611,51 +669,64 @@ function buildLocationKey(uf, cidade) {
     .toUpperCase();
 }
 
-async function fetchWeightMap(weightSource) {
+async function fetchWeightMap(weightSource, options = {}) {
   if (!weightSource?.url || !weightSource?.listName || !weightSource?.fields) return new Map();
 
   const cacheKey = JSON.stringify(weightSource);
   const cached = weightSourceCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.weights;
-
-  const sourceUrl = new URL(weightSource.url);
-  const fields = [weightSource.fields.uf, weightSource.fields.cidade, weightSource.fields.peso].filter(Boolean);
-  const token = await getGraphToken();
-  const weights = new Map();
-  const listCandidates = getListNameCandidates(weightSource.listName);
-
-  for (const listName of listCandidates) {
-    const baseUrl = `https://graph.microsoft.com/v1.0/sites/${sourceUrl.hostname}:/${sourceUrl.pathname.replace(/\/$/, '')}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
-    let nextUrl = baseUrl;
-    let loadedAny = false;
-
-    while (nextUrl) {
-      const response = await fetch(nextUrl, {
-        headers: { Accept: 'application/json;odata.metadata=none', Authorization: `Bearer ${token}` }
-      });
-      const payload = await readJsonResponse(response);
-
-      if (!response.ok) {
-        if ([400, 401, 403, 404].includes(response.status)) break;
-        throw new Error(`Erro ao consultar a lista de pesos ${listName}.`);
-      }
-
-      loadedAny = true;
-      (Array.isArray(payload.value) ? payload.value : []).forEach((item) => {
-        const fieldData = item.fields || {};
-        const key = buildLocationKey(getValue(fieldData, weightSource.fields.uf), getValue(fieldData, weightSource.fields.cidade));
-        const peso = parseMetricValue(getValue(fieldData, weightSource.fields.peso));
-        if (key !== '|' && Number.isFinite(peso) && peso > 0) weights.set(key, peso);
-      });
-      nextUrl = payload['@odata.nextLink'] || null;
-    }
-
-    if (loadedAny) break;
+  if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) return cached.weights;
+  if (weightLoadPromises.has(cacheKey)) {
+    cacheMetrics.weightLoadDeduplications += 1;
+    return weightLoadPromises.get(cacheKey);
   }
 
-  weightSourceCache.set(cacheKey, { weights, expiresAt: Date.now() + cacheTtlMs });
-  console.log(JSON.stringify({ event: 'weight_source_loaded', list: weightSource.listName, locations: weights.size }));
-  return weights;
+  const loadPromise = (async () => {
+    const sourceUrl = new URL(weightSource.url);
+    const fields = [weightSource.fields.uf, weightSource.fields.cidade, weightSource.fields.peso].filter(Boolean);
+    const token = await getGraphToken();
+    const weights = new Map();
+    const listCandidates = getListNameCandidates(weightSource.listName);
+
+    for (const listName of listCandidates) {
+      const baseUrl = `https://graph.microsoft.com/v1.0/sites/${sourceUrl.hostname}:/${sourceUrl.pathname.replace(/\/$/, '')}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
+      let nextUrl = baseUrl;
+      let loadedAny = false;
+
+      while (nextUrl) {
+        const response = await fetch(nextUrl, {
+          headers: { Accept: 'application/json;odata.metadata=none', Authorization: `Bearer ${token}` }
+        });
+        const payload = await readJsonResponse(response);
+
+        if (!response.ok) {
+          if ([400, 401, 403, 404].includes(response.status)) break;
+          throw new Error(`Erro ao consultar a lista de pesos ${listName}.`);
+        }
+
+        loadedAny = true;
+        for (const item of Array.isArray(payload.value) ? payload.value : []) {
+          const fieldData = item.fields || {};
+          const key = buildLocationKey(getValue(fieldData, weightSource.fields.uf), getValue(fieldData, weightSource.fields.cidade));
+          const peso = parseMetricValue(getValue(fieldData, weightSource.fields.peso));
+          if (key !== '|' && Number.isFinite(peso) && peso > 0) weights.set(key, peso);
+        }
+        nextUrl = payload['@odata.nextLink'] || null;
+      }
+
+      if (loadedAny) break;
+    }
+
+    weightSourceCache.set(cacheKey, { weights, expiresAt: Date.now() + cacheTtlMs });
+    console.log(JSON.stringify({ event: 'weight_source_loaded', list: weightSource.listName, locations: weights.size }));
+    return weights;
+  })();
+
+  weightLoadPromises.set(cacheKey, loadPromise);
+  try {
+    return await loadPromise;
+  } finally {
+    weightLoadPromises.delete(cacheKey);
+  }
 }
 
 function addToIndex(index, key, itemIndex) {
@@ -665,38 +736,88 @@ function addToIndex(index, key, itemIndex) {
   else index.set(key, [itemIndex]);
 }
 
-function createSourceSnapshot(items, activeListName, cacheKey) {
-  const indexes = {
-    projetista: new Map(), uf: new Map(), cidade: new Map(), ano: new Map(), mes: new Map()
+function getConfiguredFieldsForSource(site) {
+  const sourceCacheKey = buildPhysicalSourceCacheKey(site);
+  const fields = new Set();
+  const addSelectionFields = (selection) => {
+    const normalizedSelection = normalizeSiteConfig(selection);
+    if (!normalizedSelection?.url || !normalizedSelection?.listName) return;
+    if (buildPhysicalSourceCacheKey(normalizedSelection) !== sourceCacheKey) return;
+    for (const fieldName of Object.values(normalizedSelection.fields || {})) {
+      if (fieldName) fields.add(fieldName);
+    }
   };
+
+  addSelectionFields(site);
+  for (const selection of getConfiguredSelections()) addSelectionFields(selection);
+  return Array.from(fields).sort((left, right) => left.localeCompare(right));
+}
+
+function createRawSourceSnapshot(items, activeListName, cacheKey, fields) {
+  return {
+    cacheKey,
+    activeListName,
+    fields,
+    items,
+    expiresAt: Date.now() + cacheTtlMs,
+    createdAt: Date.now(),
+    lastAccessedAt: Date.now()
+  };
+}
+
+function createSourceProfileSnapshot(items, activeListName, cacheKey, sourceCacheKey, expiresAt, sourceCreatedAt) {
+  const indexes = {
+    projetista: new Map(),
+    uf: new Map(),
+    cidade: new Map(),
+    ano: new Map(),
+    mes: new Map(),
+    anoMes: new Map()
+  };
+
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index];
     addToIndex(indexes.projetista, item.projetista.toLowerCase(), index);
     addToIndex(indexes.uf, item.uf, index);
     addToIndex(indexes.cidade, item.cidade.toLowerCase(), index);
-    if (item.date) {
+    if (item.date && !Number.isNaN(item.date.getTime())) {
       const year = item.date.getFullYear();
+      const month = item.date.getMonth() + 1;
       addToIndex(indexes.ano, String(year), index);
-      addToIndex(indexes.mes, `${year}-${item.date.getMonth() + 1}`, index);
+      addToIndex(indexes.mes, String(month), index);
+      addToIndex(indexes.anoMes, `${year}-${month}`, index);
     }
   }
-  return { cacheKey, activeListName, items, indexes, expiresAt: Date.now() + cacheTtlMs, createdAt: Date.now(), lastAccessedAt: Date.now() };
+
+  return {
+    cacheKey,
+    sourceCacheKey,
+    sourceCreatedAt,
+    activeListName,
+    items,
+    indexes,
+    expiresAt,
+    createdAt: Date.now(),
+    lastAccessedAt: Date.now()
+  };
 }
 
 function serializeSourceSnapshot(snapshot) {
   return {
-    version: 1,
+    version: 2,
     activeListName: snapshot.activeListName,
+    fields: snapshot.fields,
     expiresAt: snapshot.expiresAt,
-    items: snapshot.items.map((item) => ({ ...item, date: item.date ? item.date.toISOString() : null }))
+    createdAt: snapshot.createdAt,
+    items: snapshot.items
   };
 }
 
 function hydrateSourceSnapshot(data, cacheKey) {
-  if (!data || !Array.isArray(data.items) || data.expiresAt <= Date.now()) return null;
-  const items = data.items.map((item) => ({ ...item, date: item.date ? new Date(item.date) : null }));
-  const snapshot = createSourceSnapshot(items, data.activeListName, cacheKey);
+  if (!data || data.version !== 2 || !Array.isArray(data.items) || data.expiresAt <= Date.now()) return null;
+  const snapshot = createRawSourceSnapshot(data.items, data.activeListName, cacheKey, data.fields || []);
   snapshot.expiresAt = data.expiresAt;
+  snapshot.createdAt = data.createdAt || Date.now();
   return snapshot;
 }
 
@@ -710,26 +831,38 @@ function loadPersistedSourceSnapshot(cacheKey) {
 }
 
 function persistSourceSnapshot(snapshot) {
+  let serialized;
   try {
-    const compressed = zlib.gzipSync(JSON.stringify(serializeSourceSnapshot(snapshot)));
-    fs.writeFileSync(getCacheFilePath(snapshot.cacheKey), compressed);
+    serialized = JSON.stringify(serializeSourceSnapshot(snapshot));
   } catch (error) {
-    console.warn(JSON.stringify({ event: 'source_cache_persist_error', message: error.message }));
+    console.warn(JSON.stringify({ event: 'source_cache_serialize_error', message: error.message }));
+    return;
   }
+
+  zlib.gzip(serialized, (compressionError, compressed) => {
+    if (compressionError) {
+      console.warn(JSON.stringify({ event: 'source_cache_persist_error', message: compressionError.message }));
+      return;
+    }
+    fs.writeFile(getCacheFilePath(snapshot.cacheKey), compressed, (writeError) => {
+      if (writeError) console.warn(JSON.stringify({ event: 'source_cache_persist_error', message: writeError.message }));
+    });
+  });
 }
 
-function getIndexedItems(snapshot, filters) {
+function getIndexedItems(snapshot, filters = {}) {
   const candidates = [];
   const pushIndex = (index, key) => {
     if (!key) return;
-    const values = index.get(key);
-    candidates.push(values || []);
+    candidates.push(index.get(key) || []);
   };
+
   pushIndex(snapshot.indexes.projetista, filters.projetista && String(filters.projetista).toLowerCase());
   pushIndex(snapshot.indexes.uf, filters.uf && String(filters.uf).toUpperCase());
   pushIndex(snapshot.indexes.cidade, filters.cidade && String(filters.cidade).toLowerCase());
-  if (filters.ano && filters.mes) pushIndex(snapshot.indexes.mes, `${filters.ano}-${Number(filters.mes)}`);
+  if (filters.ano && filters.mes) pushIndex(snapshot.indexes.anoMes, `${filters.ano}-${Number(filters.mes)}`);
   else if (filters.ano) pushIndex(snapshot.indexes.ano, String(filters.ano));
+  else if (filters.mes) pushIndex(snapshot.indexes.mes, String(Number(filters.mes)));
 
   if (!candidates.length) return snapshot.items;
   candidates.sort((left, right) => left.length - right.length);
@@ -740,32 +873,34 @@ function getIndexedItems(snapshot, filters) {
   for (const itemIndex of base) {
     let matches = true;
     for (const candidateSet of candidateSets) {
-      if (!candidateSet.has(itemIndex)) { matches = false; break; }
+      if (!candidateSet.has(itemIndex)) {
+        matches = false;
+        break;
+      }
     }
     if (matches) result.push(snapshot.items[itemIndex]);
   }
   return result;
 }
 
-async function loadSourceSnapshot(site, options = {}) {
-  const normalizedSite = normalizeSiteConfig(site);
+function invalidateDerivedCachesForSource(sourceCacheKey) {
+  removeProfilesForSource(sourceCacheKey);
+  for (const [key, entry] of dashboardCache) {
+    if (entry.sourceCacheKey === sourceCacheKey) dashboardCache.delete(key);
+  }
+  for (const [key, entry] of analyticsCache) {
+    if (entry.sourceCacheKey === sourceCacheKey) analyticsCache.delete(key);
+  }
+}
 
+async function loadRawSourceSnapshot(site, options = {}) {
+  const normalizedSite = normalizeSiteConfig(site);
   if (!normalizedSite || !normalizedSite.url || !normalizedSite.listName) {
     console.error('[SharePoint] Lista não configurada para a seleção:', site);
-    return createSourceSnapshot([], '', 'invalid');
+    return createRawSourceSnapshot([], '', 'invalid', []);
   }
 
-  const siteUrl = normalizedSite.url;
-
-  const fields = [
-    normalizedSite.fields.projetista,
-    normalizedSite.fields.dataConclusao,
-    normalizedSite.fields.uploadVisium,
-    normalizedSite.fields.uf,
-    normalizedSite.fields.cidade
-  ].filter(Boolean);
-
-  const sourceCacheKey = buildSourceCacheKey(normalizedSite);
+  const sourceCacheKey = buildPhysicalSourceCacheKey(normalizedSite);
   const cached = sourceListCache.get(sourceCacheKey);
   if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) {
     cacheMetrics.hits += 1;
@@ -777,23 +912,38 @@ async function loadSourceSnapshot(site, options = {}) {
     if (persisted) {
       cacheMetrics.hits += 1;
       sourceListCache.set(sourceCacheKey, persisted);
+      evictSourceCache();
+      console.log(JSON.stringify({ event: 'source_cache_disk_hit', list: persisted.activeListName, items: persisted.items.length }));
       return persisted;
     }
   }
 
-  if (sourceLoadPromises.has(sourceCacheKey)) return sourceLoadPromises.get(sourceCacheKey);
+  if (sourceLoadPromises.has(sourceCacheKey)) {
+    cacheMetrics.sourceLoadDeduplications += 1;
+    return sourceLoadPromises.get(sourceCacheKey);
+  }
+
+  const fields = getConfiguredFieldsForSource(normalizedSite);
+  if (!fields.length) throw new Error(`Nenhum campo configurado para a lista ${normalizedSite.listName}.`);
   cacheMetrics.misses += 1;
+
   const loadPromise = (async () => {
-  const siteHostname = new URL(siteUrl).hostname;
-  const sitePath = new URL(siteUrl).pathname.replace(/\/$/, '');
-  const listCandidates = getListNameCandidates(normalizedSite.listName);
-  let activeListName = normalizedSite.listName;
-  let allItems = [];
+    const graphStartedAt = Date.now();
+    const siteUrl = new URL(normalizedSite.url);
+    const siteHostname = siteUrl.hostname;
+    const sitePath = siteUrl.pathname.replace(/\/$/, '');
+    const listCandidates = getListNameCandidates(normalizedSite.listName);
     const token = await getGraphToken();
+    let activeListName = normalizedSite.listName;
+    let compactItems = [];
+    let loadedAnyCandidate = false;
+
     for (const listName of listCandidates) {
       const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
       let nextUrl = baseUrl;
-      const pageItems = [];
+      let pageNumber = 0;
+      let candidateLoaded = false;
+      const candidateItems = [];
 
       while (nextUrl) {
         const response = await fetch(nextUrl, {
@@ -802,81 +952,141 @@ async function loadSourceSnapshot(site, options = {}) {
             Authorization: `Bearer ${token}`
           }
         });
-
         const payload = await readJsonResponse(response);
-        console.log(`[SharePoint] list=${listName} page=${pageItems.length + 1} status=${response.status}`);
+        pageNumber += 1;
 
         if (!response.ok) {
           const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
           const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
-
           if ([400, 401, 403, 404].includes(response.status)) {
             console.warn(`Lista não encontrada com nome alternativo: ${listName}. Detalhe: ${detail}`);
             break;
           }
-
           throw new Error(`Erro ao consultar lista ${listName}: ${detail}`);
         }
 
-        const items = Array.isArray(payload.value) ? payload.value : [];
+        candidateLoaded = true;
         cacheMetrics.graphFetches += 1;
-        pageItems.push(...items);
+        for (const graphItem of Array.isArray(payload.value) ? payload.value : []) {
+          const sourceFields = graphItem.fields || {};
+          const compactItem = {};
+          for (const fieldName of fields) {
+            const value = getValue(sourceFields, fieldName);
+            if (value !== undefined && value !== null) compactItem[fieldName] = value;
+          }
+          candidateItems.push(compactItem);
+        }
+        console.log(`[SharePoint] list=${listName} page=${pageNumber} records=${candidateItems.length} status=${response.status}`);
         nextUrl = payload['@odata.nextLink'] || null;
       }
 
-      if (pageItems.length > 0) {
-        allItems = pageItems;
+      if (candidateLoaded) {
         activeListName = listName;
+        compactItems = candidateItems;
+        loadedAnyCandidate = true;
         break;
       }
     }
 
-
-  if (!allItems.length && listCandidates.length) {
-    console.error('[SharePoint] Nenhuma lista foi encontrada para a configuração atual.', {
-      site: normalizedSite.name,
-      url: normalizedSite.url,
-      listName: normalizedSite.listName,
-      candidates: listCandidates,
-      attemptedFields: fields
-    });
-  }
-
-  const weightMap = await fetchWeightMap(normalizedSite.weightSource);
-  const mappedItems = [];
-  for (const item of allItems) {
-      const fieldData = item.fields || {};
-      const dataConclusao = getValue(fieldData, normalizedSite.fields.dataConclusao);
-      const date = parseSharePointDate(dataConclusao);
-      const hasUploadVisiumField = Boolean(normalizedSite.fields.uploadVisium);
-      const uploadVisiumRaw = hasUploadVisiumField ? getValue(fieldData, normalizedSite.fields.uploadVisium) : '';
-      const uploadVisium = hasUploadVisiumField ? normalizeUploadValue(uploadVisiumRaw) : 0;
-      const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
-      const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
-      const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
-      const peso = weightMap.get(buildLocationKey(uf, cidade)) || 1;
-
-      mappedItems.push({
-        date,
-        uploadVisium,
-        uf,
-        cidade,
-        projetista,
-        peso
+    if (!loadedAnyCandidate) {
+      console.error('[SharePoint] Nenhuma lista foi encontrada para a configuração atual.', {
+        site: normalizedSite.name,
+        url: normalizedSite.url,
+        listName: normalizedSite.listName,
+        candidates: listCandidates,
+        attemptedFields: fields
       });
-  }
-  const snapshot = createSourceSnapshot(mappedItems, activeListName, sourceCacheKey);
-  sourceListCache.set(sourceCacheKey, snapshot);
-  evictSourceCache();
-  persistSourceSnapshot(snapshot);
-  console.log(JSON.stringify({ event: 'source_cache_saved', list: activeListName, items: mappedItems.length, ttlMs: cacheTtlMs }));
-  return snapshot;
+    }
+
+    const snapshot = createRawSourceSnapshot(compactItems, activeListName, sourceCacheKey, fields);
+    sourceListCache.set(sourceCacheKey, snapshot);
+    invalidateDerivedCachesForSource(sourceCacheKey);
+    evictSourceCache();
+    persistSourceSnapshot(snapshot);
+    console.log(JSON.stringify({
+      event: 'source_cache_saved',
+      list: activeListName,
+      items: compactItems.length,
+      fields: fields.length,
+      graphFetchMs: Date.now() - graphStartedAt,
+      ttlMs: cacheTtlMs
+    }));
+    return snapshot;
   })();
+
   sourceLoadPromises.set(sourceCacheKey, loadPromise);
   try {
     return await loadPromise;
   } finally {
     sourceLoadPromises.delete(sourceCacheKey);
+  }
+}
+
+function createProfileItems(rawItems, site, weightMap) {
+  const items = new Array(rawItems.length);
+  for (let index = 0; index < rawItems.length; index += 1) {
+    const sourceFields = rawItems[index];
+    const dataConclusao = getValue(sourceFields, site.fields.dataConclusao);
+    const date = parseSharePointDate(dataConclusao);
+    const hasUploadVisiumField = Boolean(site.fields.uploadVisium);
+    const uploadVisiumRaw = hasUploadVisiumField ? getValue(sourceFields, site.fields.uploadVisium) : '';
+    const uf = safeString(getValue(sourceFields, site.fields.uf)).toUpperCase();
+    const cidade = safeString(getValue(sourceFields, site.fields.cidade));
+    items[index] = {
+      date,
+      uploadVisium: hasUploadVisiumField ? normalizeUploadValue(uploadVisiumRaw) : 0,
+      uf,
+      cidade,
+      projetista: safeString(getValue(sourceFields, site.fields.projetista)),
+      peso: weightMap.get(buildLocationKey(uf, cidade)) || 1
+    };
+  }
+  return items;
+}
+
+async function loadSourceSnapshot(site, options = {}) {
+  const normalizedSite = normalizeSiteConfig(site);
+  if (!normalizedSite || !normalizedSite.url || !normalizedSite.listName) {
+    return createSourceProfileSnapshot([], '', 'invalid', 'invalid', Date.now() + cacheTtlMs, Date.now());
+  }
+
+  const profileCacheKey = buildSourceProfileCacheKey(normalizedSite);
+  const cached = sourceProfileCache.get(profileCacheKey);
+  if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) {
+    cacheMetrics.hits += 1;
+    return touchCacheEntry(sourceProfileCache, profileCacheKey, cached);
+  }
+
+  if (sourceProfilePromises.has(profileCacheKey)) {
+    cacheMetrics.profileLoadDeduplications += 1;
+    return sourceProfilePromises.get(profileCacheKey);
+  }
+
+  const loadPromise = (async () => {
+    const [rawSnapshot, weightMap] = await Promise.all([
+      loadRawSourceSnapshot(normalizedSite, options),
+      fetchWeightMap(normalizedSite.weightSource, options)
+    ]);
+    const items = createProfileItems(rawSnapshot.items, normalizedSite, weightMap);
+    const snapshot = createSourceProfileSnapshot(
+      items,
+      rawSnapshot.activeListName,
+      profileCacheKey,
+      rawSnapshot.cacheKey,
+      rawSnapshot.expiresAt,
+      rawSnapshot.createdAt
+    );
+    sourceProfileCache.set(profileCacheKey, snapshot);
+    evictSourceCache();
+    console.log(JSON.stringify({ event: 'source_profile_saved', list: snapshot.activeListName, items: items.length }));
+    return snapshot;
+  })();
+
+  sourceProfilePromises.set(profileCacheKey, loadPromise);
+  try {
+    return await loadPromise;
+  } finally {
+    sourceProfilePromises.delete(profileCacheKey);
   }
 }
 
@@ -894,12 +1104,16 @@ function buildResult(items, options = {}) {
   const ufs = new Set();
   const cidades = new Set();
   const projetistas = new Set();
-  const doneCount = items.filter((item) => item.date).reduce((sum, item) => sum + Number(item.peso || 1), 0);
+  let total = 0;
+  let doneCount = 0;
+  let uploadVisiumTotal = 0;
 
-  items.forEach((item) => {
+  for (const item of items) {
     const nome = safeString(item.projetista).trim();
     const uploadFlag = Number(item.uploadVisium || 0) > 0 ? 1 : 0;
     const peso = Number(item.peso || 1);
+    total += peso;
+    if (includeUploadVisium && uploadFlag) uploadVisiumTotal += 1;
 
     if (!isIgnorableProjetistaName(nome)) {
       byProjetista[nome] = (byProjetista[nome] || 0) + peso;
@@ -915,35 +1129,33 @@ function buildResult(items, options = {}) {
       const monthIndex = item.date.getMonth();
       byMonth[monthIndex].total += peso;
       years.add(item.date.getFullYear());
+      doneCount += peso;
     }
 
     if (item.uf) ufs.add(item.uf);
     if (item.cidade) cidades.add(item.cidade);
-  });
-
-  const uploadVisiumTotal = includeUploadVisium
-    ? items.filter((item) => Number(item.uploadVisium || 0) > 0).length
-    : 0;
+  }
 
   const barData = Object.entries(byProjetista)
     .map(([label, total]) => ({ label, total, upload: includeUploadVisium ? (byProjetistaUpload[label] || 0) : 0 }))
     .sort((a, b) => b.total - a.total)
     .slice(0, 15);
+  const yearsList = Array.from(years).sort((a, b) => a - b);
 
   const summary = {
-    total: items.reduce((sum, item) => sum + Number(item.peso || 1), 0),
+    total,
     done: doneCount,
     uploadVisiumTotal,
     uniqueProjetistas: Object.keys(byProjetista).length,
-    anoInicial: Math.min(...Array.from(years), 0) || new Date().getFullYear(),
-    anoFinal: Math.max(...Array.from(years), new Date().getFullYear())
+    anoInicial: yearsList[0] || new Date().getFullYear(),
+    anoFinal: yearsList[yearsList.length - 1] || new Date().getFullYear()
   };
 
   return {
     summary,
     barData,
     monthlyTrend: byMonth.map((m) => ({ label: m.label, total: m.total })),
-    years: Array.from(years).sort((a, b) => a - b),
+    years: yearsList,
     ufs: Array.from(ufs).sort(),
     cidades: Array.from(cidades).sort((a, b) => a.localeCompare(b)),
     projetistas: Array.from(projetistas).sort((a, b) => a.localeCompare(b)),
@@ -953,9 +1165,25 @@ function buildResult(items, options = {}) {
 
 function buildExecutiveAnalytics(items, comparisonItems = items) {
   let latestDate = null;
+  const designers = new Map();
+  const cities = new Map();
+  let topCity = null;
+
   for (const item of items) {
-    if (item.date && !Number.isNaN(item.date.getTime()) && (!latestDate || item.date > latestDate)) latestDate = item.date;
+    if (!item.date || Number.isNaN(item.date.getTime())) continue;
+    if (!latestDate || item.date > latestDate) latestDate = item.date;
+
+    const peso = Number(item.peso || 1);
+    const designer = safeString(item.projetista);
+    const city = safeString(item.cidade);
+    if (!isIgnorableProjetistaName(designer)) designers.set(designer, (designers.get(designer) || 0) + peso);
+    if (city) {
+      const cityTotal = (cities.get(city) || 0) + peso;
+      cities.set(city, cityTotal);
+      if (!topCity || cityTotal > topCity.total) topCity = { name: city, total: cityTotal };
+    }
   }
+
   latestDate = latestDate || new Date();
   const dayStart = new Date(latestDate.getFullYear(), latestDate.getMonth(), latestDate.getDate());
   const previousDayStart = new Date(dayStart);
@@ -964,8 +1192,6 @@ function buildExecutiveAnalytics(items, comparisonItems = items) {
   weekStart.setDate(weekStart.getDate() - 6);
   const monthStart = new Date(dayStart.getFullYear(), dayStart.getMonth(), 1);
   const previousMonthStart = new Date(dayStart.getFullYear(), dayStart.getMonth() - 1, 1);
-  const designers = new Map();
-  const cities = new Map();
   let dayTotal = 0;
   let previousDayTotal = 0;
   let weekTotal = 0;
@@ -983,15 +1209,6 @@ function buildExecutiveAnalytics(items, comparisonItems = items) {
     if (item.date >= previousMonthStart && item.date < monthStart) previousMonthTotal += peso;
   }
 
-  for (const item of items) {
-    if (!item.date) continue;
-    const designer = safeString(item.projetista);
-    const city = safeString(item.cidade);
-    const peso = Number(item.peso || 1);
-
-    if (!isIgnorableProjetistaName(designer)) designers.set(designer, (designers.get(designer) || 0) + peso);
-    if (city) cities.set(city, (cities.get(city) || 0) + peso);
-  }
   const elapsedDays = Math.max(1, Math.floor((dayStart - monthStart) / 86400000) + 1);
   const daysInMonth = new Date(dayStart.getFullYear(), dayStart.getMonth() + 1, 0).getDate();
 
@@ -1011,9 +1228,7 @@ function buildExecutiveAnalytics(items, comparisonItems = items) {
       .map(([name, total]) => ({ name, total }))
       .sort((left, right) => right.total - left.total)
       .slice(0, 10),
-    topCity: Array.from(cities.entries())
-      .map(([name, total]) => ({ name, total }))
-      .sort((left, right) => right.total - left.total)[0] || null
+    topCity
   };
 }
 
@@ -1032,23 +1247,32 @@ app.get('/api/cache/stats', (_, res) => {
   res.json({
     dashboardCacheEntries: dashboardCache.size,
     sourceCacheEntries: sourceListCache.size,
+    sourceProfileCacheEntries: sourceProfileCache.size,
     weightCacheEntries: weightSourceCache.size,
     analyticsCacheEntries: analyticsCache.size,
     sourceCachedItems: totalSourceItems(),
+    sourceProfileCachedItems: totalProfileItems(),
+    totalCachedItems: totalCachedItems(),
     cacheHits: cacheMetrics.hits,
     cacheMisses: cacheMetrics.misses,
     hitRate: `${totalRequests ? ((cacheMetrics.hits / totalRequests) * 100).toFixed(2) : '0.00'}%`,
     graphFetches: cacheMetrics.graphFetches,
-    tokenRefreshes: cacheMetrics.tokenRefreshes
+    tokenRefreshes: cacheMetrics.tokenRefreshes,
+    activeSourceLoads: sourceLoadPromises.size,
+    activeProfileLoads: sourceProfilePromises.size,
+    activeWeightLoads: weightLoadPromises.size,
+    sourceLoadDeduplications: cacheMetrics.sourceLoadDeduplications,
+    profileLoadDeduplications: cacheMetrics.profileLoadDeduplications,
+    weightLoadDeduplications: cacheMetrics.weightLoadDeduplications
   });
 });
 
 app.post('/api/cache/clear', (req, res) => {
   dashboardCache.clear();
   sourceListCache.clear();
+  sourceProfileCache.clear();
   weightSourceCache.clear();
   analyticsCache.clear();
-  sourceLoadPromises.clear();
   if (req.query.persistent === 'true') {
     for (const file of fs.readdirSync(cacheDirectory)) {
       if (file.startsWith('source-') && file.endsWith('.json.gz')) fs.unlinkSync(path.join(cacheDirectory, file));
@@ -1124,15 +1348,45 @@ function getConfiguredSelections() {
 
 async function warmupCaches() {
   const selections = getConfiguredSelections();
-  console.log(JSON.stringify({ event: 'cache_warmup_started', sources: selections.length }));
+  const byPhysicalSource = new Map();
   for (const selection of selections) {
+    const sourceCacheKey = buildPhysicalSourceCacheKey(selection);
+    const group = byPhysicalSource.get(sourceCacheKey) || [];
+    group.push(selection);
+    byPhysicalSource.set(sourceCacheKey, group);
+  }
+
+  console.log(JSON.stringify({
+    event: 'cache_warmup_started',
+    selections: selections.length,
+    physicalSources: byPhysicalSource.size
+  }));
+
+  for (const [sourceCacheKey, sourceSelections] of byPhysicalSource) {
+    const primarySelection = sourceSelections[0];
     try {
-      await loadSourceSnapshot(selection);
+      await loadRawSourceSnapshot(primarySelection);
+      for (const selection of sourceSelections) {
+        const snapshot = await loadSourceSnapshot(selection);
+        const filters = { projetista: '', uf: '', cidade: '', mes: '', ano: '' };
+        const analyticsKey = `analytics:${buildDashboardCacheKey(selection.name, selection.activityName, selection.subActivityName, filters)}`;
+        analyticsCache.set(analyticsKey, {
+          value: buildExecutiveAnalytics(snapshot.items, snapshot.items),
+          sourceCacheKey,
+          expiresAt: snapshot.expiresAt,
+          lastAccessedAt: Date.now()
+        });
+      }
     } catch (error) {
-      console.warn(JSON.stringify({ event: 'cache_warmup_error', list: selection.listName, message: error.message }));
+      console.warn(JSON.stringify({ event: 'cache_warmup_error', list: primarySelection.listName, message: error.message }));
     }
   }
-  console.log(JSON.stringify({ event: 'cache_warmup_finished', sources: sourceListCache.size, items: totalSourceItems() }));
+  console.log(JSON.stringify({
+    event: 'cache_warmup_finished',
+    physicalSources: sourceListCache.size,
+    sourceItems: totalSourceItems(),
+    profileItems: totalProfileItems()
+  }));
 }
 
 app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
@@ -1159,25 +1413,51 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     if (!shouldRefresh && cached && cached.expiresAt > Date.now()) {
       cacheMetrics.hits += 1;
       console.log(JSON.stringify({ event: 'cache_hit', requestId: req.requestId, key: cacheKey }));
-      return res.json(paginateDashboardPayload(cached.payload, req.query));
+      const paginationStartedAt = Date.now();
+      const responsePayload = paginateDashboardPayload(touchCacheEntry(dashboardCache, cacheKey, cached).payload, req.query);
+      console.log(JSON.stringify({
+        event: 'performance',
+        requestId: req.requestId,
+        cacheMs: Date.now() - requestStartedAt,
+        graphFetchMs: 0,
+        filterMs: 0,
+        analyticsMs: 0,
+        aggregationMs: 0,
+        paginationMs: Date.now() - paginationStartedAt,
+        totalMs: Date.now() - requestStartedAt
+      }));
+      return res.json(responsePayload);
     }
 
     if (cached) dashboardCache.delete(cacheKey);
     cacheMetrics.misses += 1;
 
-    const items = await fetchListItems(selectedSite, filters, { forceRefresh: shouldRefresh });
+    const sourceStartedAt = Date.now();
+    const snapshot = await loadSourceSnapshot(selectedSite, { forceRefresh: shouldRefresh });
+    const sourceMs = Date.now() - sourceStartedAt;
+    const filteringStartedAt = Date.now();
+    const items = getIndexedItems(snapshot, filters);
     const comparisonFilters = { ...filters, mes: '', ano: '' };
-    const comparisonItems = await fetchListItems(selectedSite, comparisonFilters);
+    const comparisonItems = getIndexedItems(snapshot, comparisonFilters);
+    const filterMs = Date.now() - filteringStartedAt;
     const analyticsKey = `analytics:${cacheKey}`;
-    let analytics = !shouldRefresh && analyticsCache.get(analyticsKey)?.expiresAt > Date.now()
-      ? analyticsCache.get(analyticsKey).value
+    const cachedAnalytics = !shouldRefresh ? analyticsCache.get(analyticsKey) : null;
+    let analytics = cachedAnalytics && cachedAnalytics.expiresAt > Date.now()
+      ? touchCacheEntry(analyticsCache, analyticsKey, cachedAnalytics).value
       : null;
     const analyticsStartedAt = Date.now();
     if (!analytics) {
       analytics = buildExecutiveAnalytics(items, comparisonItems);
-      analyticsCache.set(analyticsKey, { value: analytics, expiresAt: Date.now() + cacheTtlMs });
+      analyticsCache.set(analyticsKey, {
+        value: analytics,
+        sourceCacheKey: snapshot.sourceCacheKey,
+        expiresAt: Date.now() + cacheTtlMs,
+        lastAccessedAt: Date.now()
+      });
     }
+    const analyticsMs = Date.now() - analyticsStartedAt;
     console.log(`[dashboard] items received=${items.length} for ${siteName}/${activityName}`);
+    const aggregationStartedAt = Date.now();
     const result = buildResult(items, { includeUploadVisium: Boolean(selectedSite?.fields?.uploadVisium) });
     const payload = {
       site: selectedSite,
@@ -1193,15 +1473,24 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
       ...result,
       analytics
     };
+    const aggregationMs = Date.now() - aggregationStartedAt;
 
-    dashboardCache.set(cacheKey, { payload, expiresAt: Date.now() + cacheTtlMs });
-    while (dashboardCache.size > 500) dashboardCache.delete(dashboardCache.keys().next().value);
+    dashboardCache.set(cacheKey, {
+      payload,
+      sourceCacheKey: snapshot.sourceCacheKey,
+      expiresAt: Date.now() + cacheTtlMs,
+      lastAccessedAt: Date.now()
+    });
+    while (dashboardCache.size > dashboardCacheMaxEntries) dashboardCache.delete(dashboardCache.keys().next().value);
     const paginationStartedAt = Date.now();
     const responsePayload = paginateDashboardPayload(payload, req.query);
     console.log(JSON.stringify({
       event: 'performance', requestId: req.requestId,
       cacheMs: 0,
-      analyticsMs: Date.now() - analyticsStartedAt,
+      graphFetchMs: sourceMs,
+      filterMs,
+      analyticsMs,
+      aggregationMs,
       paginationMs: Date.now() - paginationStartedAt,
       totalMs: Date.now() - requestStartedAt
     }));

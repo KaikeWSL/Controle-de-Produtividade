@@ -71,6 +71,32 @@ Em seguida acesse:
 http://localhost:3000
 ```
 
+## Cache e desempenho
+
+O servidor mantém três níveis de cache: resposta por filtro, fonte SharePoint normalizada em memória e snapshot compactado `gzip` em `.cache/`. A fonte armazena somente os campos usados pelo dashboard, cria índices por projetista, UF, cidade, ano e mês e é compartilhada por todos os usuários. Consultas simultâneas para a mesma lista usam uma única chamada ao Microsoft Graph.
+
+Configure no Render conforme a memória disponível do serviço:
+
+```bash
+CACHE_TTL_SECONDS=300
+CACHE_MAX_ITEMS=100000
+CACHE_CLEANUP_INTERVAL=60
+CACHE_WARMUP_ENABLED=true
+```
+
+`CACHE_MAX_ITEMS` limita a quantidade total de registros normalizados em memória e remove a fonte menos recentemente usada. O disco local do Render pode ser efêmero; para cache persistente entre deploys/restarts, anexe um Persistent Disk e defina `CACHE_DIRECTORY` para um caminho nesse disco.
+
+Endpoints operacionais:
+
+```text
+GET  /api/cache/stats
+POST /api/cache/clear
+POST /api/cache/clear?persistent=true
+POST /api/cache/refresh
+```
+
+`POST /api/cache/refresh` aceita opcionalmente JSON com `site`, `activity` e `subactivity`. A rota do dashboard aceita `page` e `pageSize` como extensão compatível, por exemplo `/api/dashboard?site=Hfc&page=1&pageSize=100`.
+
 ## Deploy em Render + Netlify
 
 ### Backend no Render
