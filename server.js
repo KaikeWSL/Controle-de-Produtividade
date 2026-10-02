@@ -1,11 +1,18 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
+const zlib = require('zlib');
 const cors = require('cors');
+const compression = require('compression');
 
 const app = express();
 const port = process.env.PORT || 3000;
 const cacheTtlMs = Math.max(30, Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
+const cacheMaxItems = Math.max(1000, Number(process.env.CACHE_MAX_ITEMS) || 100000);
+const cacheCleanupIntervalMs = Math.max(30, Number(process.env.CACHE_CLEANUP_INTERVAL) || 60) * 1000;
+const cacheWarmupEnabled = String(process.env.CACHE_WARMUP_ENABLED || 'true').toLowerCase() !== 'false';
+const cacheDirectory = path.join(__dirname, process.env.CACHE_DIRECTORY || '.cache');
 const rateLimitWindowMs = 60 * 1000;
 const rateLimitMaxRequests = Math.max(10, Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 120);
 
@@ -45,8 +52,14 @@ const config = loadConfig();
 const dashboardCache = new Map();
 const weightSourceCache = new Map();
 const sourceListCache = new Map();
+const analyticsCache = new Map();
+const sourceLoadPromises = new Map();
 const requestBuckets = new Map();
+const cacheMetrics = { hits: 0, misses: 0, graphFetches: 0, tokenRefreshes: 0 };
 let graphTokenCache = null;
+let graphTokenPromise = null;
+
+fs.mkdirSync(cacheDirectory, { recursive: true });
 
 function getPublicConfig(source) {
   return { sites: Array.isArray(source.sites) ? source.sites : [] };
@@ -80,13 +93,15 @@ function rateLimit(req, res, next) {
 }
 
 function validateDashboardQuery(req, res, next) {
-  const allowedKeys = new Set(['site', 'activity', 'subactivity', 'projetista', 'uf', 'cidade', 'mes', 'ano', 'refresh']);
+  const allowedKeys = new Set(['site', 'activity', 'subactivity', 'projetista', 'uf', 'cidade', 'mes', 'ano', 'refresh', 'page', 'pageSize']);
   const invalidKey = Object.keys(req.query).find((key) => !allowedKeys.has(key));
   const invalidText = ['site', 'activity', 'subactivity', 'projetista', 'uf', 'cidade'].find((key) => String(req.query[key] || '').length > 120);
   const month = String(req.query.mes || '');
   const year = String(req.query.ano || '');
+  const page = String(req.query.page || '');
+  const pageSize = String(req.query.pageSize || '');
 
-  if (invalidKey || invalidText || (month && !/^(?:[1-9]|1[0-2])$/.test(month)) || (year && !/^\d{4}$/.test(year))) {
+  if (invalidKey || invalidText || (month && !/^(?:[1-9]|1[0-2])$/.test(month)) || (year && !/^\d{4}$/.test(year)) || (page && !/^\d+$/.test(page)) || (pageSize && !/^\d+$/.test(pageSize))) {
     return res.status(400).json({ message: 'Parâmetros de filtro inválidos.' });
   }
 
@@ -94,6 +109,7 @@ function validateDashboardQuery(req, res, next) {
 }
 
 app.use(applySecurityHeaders);
+app.use(compression({ threshold: 1024 }));
 app.use(rateLimit);
 app.use((req, res, next) => {
   const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -117,6 +133,50 @@ function buildDashboardCacheKey(siteName, activityName, subActivityName, filters
     }
   });
 }
+
+function buildSourceCacheKey(site) {
+  return JSON.stringify({ url: site.url, listName: site.listName, fields: site.fields });
+}
+
+function getCacheFilePath(cacheKey) {
+  const hash = crypto.createHash('sha256').update(cacheKey).digest('hex');
+  return path.join(cacheDirectory, `source-${hash}.json.gz`);
+}
+
+function touchCacheEntry(cache, key, entry) {
+  cache.delete(key);
+  entry.lastAccessedAt = Date.now();
+  cache.set(key, entry);
+  return entry;
+}
+
+function totalSourceItems() {
+  let total = 0;
+  for (const entry of sourceListCache.values()) total += entry.items.length;
+  return total;
+}
+
+function evictSourceCache() {
+  const now = Date.now();
+  for (const [key, entry] of sourceListCache) {
+    if (entry.expiresAt <= now) sourceListCache.delete(key);
+  }
+  while (totalSourceItems() > cacheMaxItems && sourceListCache.size) {
+    sourceListCache.delete(sourceListCache.keys().next().value);
+  }
+}
+
+function cleanupCaches() {
+  const now = Date.now();
+  [dashboardCache, weightSourceCache, analyticsCache].forEach((cache) => {
+    for (const [key, entry] of cache) {
+      if (entry.expiresAt <= now) cache.delete(key);
+    }
+  });
+  evictSourceCache();
+}
+
+setInterval(cleanupCaches, cacheCleanupIntervalMs).unref();
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:8000')
   .split(',')
@@ -446,7 +506,9 @@ async function readJsonResponse(response) {
 
 async function getGraphToken() {
   if (graphTokenCache && graphTokenCache.expiresAt > Date.now()) return graphTokenCache.accessToken;
+  if (graphTokenPromise) return graphTokenPromise;
 
+  graphTokenPromise = (async () => {
   const headers = {
     'Content-Type': 'application/x-www-form-urlencoded'
   };
@@ -470,7 +532,16 @@ async function getGraphToken() {
     accessToken: data.access_token,
     expiresAt: Date.now() + Math.max(60, Number(data.expires_in || 3600) - 120) * 1000
   };
+  cacheMetrics.tokenRefreshes += 1;
+  console.log(JSON.stringify({ event: 'graph_token_refreshed', expiresAt: new Date(graphTokenCache.expiresAt).toISOString() }));
   return graphTokenCache.accessToken;
+  })();
+
+  try {
+    return await graphTokenPromise;
+  } finally {
+    graphTokenPromise = null;
+  }
 }
 
 async function getSharePointToken(siteUrl) {
@@ -587,12 +658,101 @@ async function fetchWeightMap(weightSource) {
   return weights;
 }
 
-async function fetchListItems(site, filters = {}, options = {}) {
+function addToIndex(index, key, itemIndex) {
+  if (!key) return;
+  const values = index.get(key);
+  if (values) values.push(itemIndex);
+  else index.set(key, [itemIndex]);
+}
+
+function createSourceSnapshot(items, activeListName, cacheKey) {
+  const indexes = {
+    projetista: new Map(), uf: new Map(), cidade: new Map(), ano: new Map(), mes: new Map()
+  };
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    addToIndex(indexes.projetista, item.projetista.toLowerCase(), index);
+    addToIndex(indexes.uf, item.uf, index);
+    addToIndex(indexes.cidade, item.cidade.toLowerCase(), index);
+    if (item.date) {
+      const year = item.date.getFullYear();
+      addToIndex(indexes.ano, String(year), index);
+      addToIndex(indexes.mes, `${year}-${item.date.getMonth() + 1}`, index);
+    }
+  }
+  return { cacheKey, activeListName, items, indexes, expiresAt: Date.now() + cacheTtlMs, createdAt: Date.now(), lastAccessedAt: Date.now() };
+}
+
+function serializeSourceSnapshot(snapshot) {
+  return {
+    version: 1,
+    activeListName: snapshot.activeListName,
+    expiresAt: snapshot.expiresAt,
+    items: snapshot.items.map((item) => ({ ...item, date: item.date ? item.date.toISOString() : null }))
+  };
+}
+
+function hydrateSourceSnapshot(data, cacheKey) {
+  if (!data || !Array.isArray(data.items) || data.expiresAt <= Date.now()) return null;
+  const items = data.items.map((item) => ({ ...item, date: item.date ? new Date(item.date) : null }));
+  const snapshot = createSourceSnapshot(items, data.activeListName, cacheKey);
+  snapshot.expiresAt = data.expiresAt;
+  return snapshot;
+}
+
+function loadPersistedSourceSnapshot(cacheKey) {
+  try {
+    const compressed = fs.readFileSync(getCacheFilePath(cacheKey));
+    return hydrateSourceSnapshot(JSON.parse(zlib.gunzipSync(compressed).toString('utf8')), cacheKey);
+  } catch {
+    return null;
+  }
+}
+
+function persistSourceSnapshot(snapshot) {
+  try {
+    const compressed = zlib.gzipSync(JSON.stringify(serializeSourceSnapshot(snapshot)));
+    fs.writeFileSync(getCacheFilePath(snapshot.cacheKey), compressed);
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'source_cache_persist_error', message: error.message }));
+  }
+}
+
+function getIndexedItems(snapshot, filters) {
+  const candidates = [];
+  const pushIndex = (index, key) => {
+    if (!key) return;
+    const values = index.get(key);
+    candidates.push(values || []);
+  };
+  pushIndex(snapshot.indexes.projetista, filters.projetista && String(filters.projetista).toLowerCase());
+  pushIndex(snapshot.indexes.uf, filters.uf && String(filters.uf).toUpperCase());
+  pushIndex(snapshot.indexes.cidade, filters.cidade && String(filters.cidade).toLowerCase());
+  if (filters.ano && filters.mes) pushIndex(snapshot.indexes.mes, `${filters.ano}-${Number(filters.mes)}`);
+  else if (filters.ano) pushIndex(snapshot.indexes.ano, String(filters.ano));
+
+  if (!candidates.length) return snapshot.items;
+  candidates.sort((left, right) => left.length - right.length);
+  const base = candidates[0];
+  if (!base.length) return [];
+  const candidateSets = candidates.slice(1).map((values) => new Set(values));
+  const result = [];
+  for (const itemIndex of base) {
+    let matches = true;
+    for (const candidateSet of candidateSets) {
+      if (!candidateSet.has(itemIndex)) { matches = false; break; }
+    }
+    if (matches) result.push(snapshot.items[itemIndex]);
+  }
+  return result;
+}
+
+async function loadSourceSnapshot(site, options = {}) {
   const normalizedSite = normalizeSiteConfig(site);
 
   if (!normalizedSite || !normalizedSite.url || !normalizedSite.listName) {
     console.error('[SharePoint] Lista não configurada para a seleção:', site);
-    return [];
+    return createSourceSnapshot([], '', 'invalid');
   }
 
   const siteUrl = normalizedSite.url;
@@ -605,19 +765,30 @@ async function fetchListItems(site, filters = {}, options = {}) {
     normalizedSite.fields.cidade
   ].filter(Boolean);
 
+  const sourceCacheKey = buildSourceCacheKey(normalizedSite);
+  const cached = sourceListCache.get(sourceCacheKey);
+  if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) {
+    cacheMetrics.hits += 1;
+    return touchCacheEntry(sourceListCache, sourceCacheKey, cached);
+  }
+
+  if (!options.forceRefresh) {
+    const persisted = loadPersistedSourceSnapshot(sourceCacheKey);
+    if (persisted) {
+      cacheMetrics.hits += 1;
+      sourceListCache.set(sourceCacheKey, persisted);
+      return persisted;
+    }
+  }
+
+  if (sourceLoadPromises.has(sourceCacheKey)) return sourceLoadPromises.get(sourceCacheKey);
+  cacheMetrics.misses += 1;
+  const loadPromise = (async () => {
   const siteHostname = new URL(siteUrl).hostname;
   const sitePath = new URL(siteUrl).pathname.replace(/\/$/, '');
   const listCandidates = getListNameCandidates(normalizedSite.listName);
   let activeListName = normalizedSite.listName;
   let allItems = [];
-  const sourceCacheKey = JSON.stringify({ url: siteUrl, listName: normalizedSite.listName, fields });
-  const sourceCache = sourceListCache.get(sourceCacheKey);
-
-  if (!options.forceRefresh && sourceCache && sourceCache.expiresAt > Date.now()) {
-    allItems = sourceCache.items;
-    activeListName = sourceCache.activeListName;
-    console.log(JSON.stringify({ event: 'source_cache_hit', list: activeListName, items: allItems.length }));
-  } else {
     const token = await getGraphToken();
     for (const listName of listCandidates) {
       const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
@@ -648,6 +819,7 @@ async function fetchListItems(site, filters = {}, options = {}) {
         }
 
         const items = Array.isArray(payload.value) ? payload.value : [];
+        cacheMetrics.graphFetches += 1;
         pageItems.push(...items);
         nextUrl = payload['@odata.nextLink'] || null;
       }
@@ -659,11 +831,6 @@ async function fetchListItems(site, filters = {}, options = {}) {
       }
     }
 
-    if (allItems.length) {
-      sourceListCache.set(sourceCacheKey, { items: allItems, activeListName, expiresAt: Date.now() + cacheTtlMs });
-      console.log(JSON.stringify({ event: 'source_cache_saved', list: activeListName, items: allItems.length, ttlMs: cacheTtlMs }));
-    }
-  }
 
   if (!allItems.length && listCandidates.length) {
     console.error('[SharePoint] Nenhuma lista foi encontrada para a configuração atual.', {
@@ -675,11 +842,9 @@ async function fetchListItems(site, filters = {}, options = {}) {
     });
   }
 
-  let uploadDebugLogged = false;
   const weightMap = await fetchWeightMap(normalizedSite.weightSource);
-
-  const mappedItems = allItems
-    .map((item) => {
+  const mappedItems = [];
+  for (const item of allItems) {
       const fieldData = item.fields || {};
       const dataConclusao = getValue(fieldData, normalizedSite.fields.dataConclusao);
       const date = parseSharePointDate(dataConclusao);
@@ -691,73 +856,33 @@ async function fetchListItems(site, filters = {}, options = {}) {
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
       const peso = weightMap.get(buildLocationKey(uf, cidade)) || 1;
 
-      const shouldLogProblemActivity = ['Migração', 'MIGRAO', 'Sar Fo', 'Revisões', 'Revises', 'As-Built', 'AsBuilt'].includes(normalizedSite.activityName || normalizedSite.name || '')
-        || ['Migração', 'MIGRAO', 'Sar Fo', 'Revisões', 'Revises', 'As-Built', 'AsBuilt'].includes(normalizedSite.listName || '');
-
-      if (!date && normalizedSite.fields.dataConclusao && shouldLogProblemActivity) {
-        console.warn('[SharePoint] Coluna de data não reconhecida ou vazia.', {
-          listName: normalizedSite.listName,
-          activityName: normalizedSite.activityName || normalizedSite.name,
-          fieldName: normalizedSite.fields.dataConclusao,
-          rawValue: dataConclusao,
-          sampleKeys: Object.keys(fieldData).slice(0, 20),
-          sampleItem: Object.fromEntries(Object.entries(fieldData).slice(0, 6))
-        });
-      }
-
-      if (
-        !normalizedSite.fields.dataConclusao &&
-        !normalizedSite.fields.projetista &&
-        shouldLogProblemActivity
-      ) {
-        console.error('[SharePoint] Colunas obrigatórias ausentes para a atividade.', {
-          listName: normalizedSite.listName,
-          activityName: normalizedSite.activityName || normalizedSite.name,
-          fields: normalizedSite.fields
-        });
-      }
-
-      if (
-        !uploadDebugLogged &&
-        normalizedSite.fields.uploadVisium &&
-        (uploadVisiumRaw === '' || uploadVisiumRaw === undefined || uploadVisiumRaw === null)
-      ) {
-        console.log('[UploadVisium debug]', {
-          listName: normalizedSite.listName,
-          fieldName: normalizedSite.fields.uploadVisium,
-          sampleKeys: Object.keys(fieldData).slice(0, 10),
-          sampleItem: Object.fromEntries(Object.entries(fieldData).slice(0, 5)),
-          message: 'Campo configurado, porém vazio no payload real do SharePoint.'
-        });
-        uploadDebugLogged = true;
-      }
-
-      return {
+      mappedItems.push({
         date,
         uploadVisium,
         uf,
         cidade,
         projetista,
-        peso,
-        raw: item
-      };
-    })
-    .filter((item) => {
-      if (filters.projetista && String(item.projetista || '').toLowerCase() !== String(filters.projetista).toLowerCase()) return false;
-      if (filters.uf && item.uf !== filters.uf) return false;
-      if (filters.cidade && String(item.cidade || '').toLowerCase() !== String(filters.cidade).toLowerCase()) return false;
-      if (item.date) {
-        if (filters.ano && item.date.getFullYear() !== Number(filters.ano)) return false;
-        if (filters.mes && item.date.getMonth() + 1 !== Number(filters.mes)) return false;
-      } else if (filters.ano || filters.mes) {
-        return false;
-      }
+        peso
+      });
+  }
+  const snapshot = createSourceSnapshot(mappedItems, activeListName, sourceCacheKey);
+  sourceListCache.set(sourceCacheKey, snapshot);
+  evictSourceCache();
+  persistSourceSnapshot(snapshot);
+  console.log(JSON.stringify({ event: 'source_cache_saved', list: activeListName, items: mappedItems.length, ttlMs: cacheTtlMs }));
+  return snapshot;
+  })();
+  sourceLoadPromises.set(sourceCacheKey, loadPromise);
+  try {
+    return await loadPromise;
+  } finally {
+    sourceLoadPromises.delete(sourceCacheKey);
+  }
+}
 
-      return true;
-    });
-
-  console.log(`[SharePoint] list=${normalizedSite.listName} loaded=${mappedItems.length} filtered=${mappedItems.length} raw=${allItems.length}`);
-  return mappedItems;
+async function fetchListItems(site, filters = {}, options = {}) {
+  const snapshot = await loadSourceSnapshot(site, options);
+  return getIndexedItems(snapshot, filters);
 }
 
 function buildResult(items, options = {}) {
@@ -827,12 +952,11 @@ function buildResult(items, options = {}) {
 }
 
 function buildExecutiveAnalytics(items, comparisonItems = items) {
-  const datedItems = items.filter((item) => item.date);
-  const comparisonDates = comparisonItems
-    .filter((item) => !Number.isNaN(item.date.getTime()))
-    .map((item) => ({ date: item.date, peso: Number(item.peso || 1) }));
-  const latestDates = datedItems.filter((item) => !Number.isNaN(item.date.getTime()));
-  const latestDate = latestDates.length ? new Date(Math.max(...latestDates.map((item) => item.date.getTime()))) : new Date();
+  let latestDate = null;
+  for (const item of items) {
+    if (item.date && !Number.isNaN(item.date.getTime()) && (!latestDate || item.date > latestDate)) latestDate = item.date;
+  }
+  latestDate = latestDate || new Date();
   const dayStart = new Date(latestDate.getFullYear(), latestDate.getMonth(), latestDate.getDate());
   const previousDayStart = new Date(dayStart);
   previousDayStart.setDate(previousDayStart.getDate() - 1);
@@ -842,24 +966,32 @@ function buildExecutiveAnalytics(items, comparisonItems = items) {
   const previousMonthStart = new Date(dayStart.getFullYear(), dayStart.getMonth() - 1, 1);
   const designers = new Map();
   const cities = new Map();
-  const countBetween = (start, end) => comparisonDates
-    .filter((item) => item.date >= start && item.date < end)
-    .reduce((sum, item) => sum + item.peso, 0);
+  let dayTotal = 0;
+  let previousDayTotal = 0;
+  let weekTotal = 0;
+  let monthTotal = 0;
+  let previousMonthTotal = 0;
+  const dayEnd = new Date(dayStart.getTime() + 86400000);
 
-  datedItems.forEach((item) => {
+  for (const item of comparisonItems) {
+    if (!item.date || Number.isNaN(item.date.getTime())) continue;
+    const peso = Number(item.peso || 1);
+    if (item.date >= dayStart && item.date < dayEnd) dayTotal += peso;
+    if (item.date >= previousDayStart && item.date < dayStart) previousDayTotal += peso;
+    if (item.date >= weekStart && item.date < dayEnd) weekTotal += peso;
+    if (item.date >= monthStart && item.date < dayEnd) monthTotal += peso;
+    if (item.date >= previousMonthStart && item.date < monthStart) previousMonthTotal += peso;
+  }
+
+  for (const item of items) {
+    if (!item.date) continue;
     const designer = safeString(item.projetista);
     const city = safeString(item.cidade);
     const peso = Number(item.peso || 1);
 
     if (!isIgnorableProjetistaName(designer)) designers.set(designer, (designers.get(designer) || 0) + peso);
     if (city) cities.set(city, (cities.get(city) || 0) + peso);
-  });
-
-  const dayTotal = countBetween(dayStart, new Date(dayStart.getTime() + 86400000));
-  const previousDayTotal = countBetween(previousDayStart, dayStart);
-  const weekTotal = countBetween(weekStart, new Date(dayStart.getTime() + 86400000));
-  const monthTotal = countBetween(monthStart, new Date(dayStart.getTime() + 86400000));
-  const previousMonthTotal = countBetween(previousMonthStart, monthStart);
+  }
   const elapsedDays = Math.max(1, Math.floor((dayStart - monthStart) / 86400000) + 1);
   const daysInMonth = new Date(dayStart.getFullYear(), dayStart.getMonth() + 1, 0).getDate();
 
@@ -895,6 +1027,46 @@ app.get('/api/config', (_, res) => {
   res.json(getPublicConfig(config));
 });
 
+app.get('/api/cache/stats', (_, res) => {
+  const totalRequests = cacheMetrics.hits + cacheMetrics.misses;
+  res.json({
+    dashboardCacheEntries: dashboardCache.size,
+    sourceCacheEntries: sourceListCache.size,
+    weightCacheEntries: weightSourceCache.size,
+    analyticsCacheEntries: analyticsCache.size,
+    sourceCachedItems: totalSourceItems(),
+    cacheHits: cacheMetrics.hits,
+    cacheMisses: cacheMetrics.misses,
+    hitRate: `${totalRequests ? ((cacheMetrics.hits / totalRequests) * 100).toFixed(2) : '0.00'}%`,
+    graphFetches: cacheMetrics.graphFetches,
+    tokenRefreshes: cacheMetrics.tokenRefreshes
+  });
+});
+
+app.post('/api/cache/clear', (req, res) => {
+  dashboardCache.clear();
+  sourceListCache.clear();
+  weightSourceCache.clear();
+  analyticsCache.clear();
+  sourceLoadPromises.clear();
+  if (req.query.persistent === 'true') {
+    for (const file of fs.readdirSync(cacheDirectory)) {
+      if (file.startsWith('source-') && file.endsWith('.json.gz')) fs.unlinkSync(path.join(cacheDirectory, file));
+    }
+  }
+  res.json({ ok: true, persistentCleared: req.query.persistent === 'true' });
+});
+
+app.post('/api/cache/refresh', async (req, res) => {
+  try {
+    const selectedSite = resolveSelectedSite(req.body?.site || config.sites[0]?.name, req.body?.activity || '', req.body?.subactivity || '');
+    const snapshot = await loadSourceSnapshot(selectedSite, { forceRefresh: true });
+    res.json({ ok: true, list: snapshot.activeListName, records: snapshot.items.length });
+  } catch (error) {
+    res.status(502).json({ message: 'Não foi possível atualizar o cache.', detail: error.message });
+  }
+});
+
 app.post('/api/reports/summary-snapshot', async (req, res) => {
   try {
     const pngDataUrl = String(req.body?.pngDataUrl || '');
@@ -915,8 +1087,57 @@ app.post('/api/reports/summary-snapshot', async (req, res) => {
   }
 });
 
+function paginateDashboardPayload(payload, query) {
+  if (!query.page && !query.pageSize) return payload;
+  const page = Math.max(1, Number(query.page) || 1);
+  const pageSize = Math.min(1000, Math.max(1, Number(query.pageSize) || 100));
+  const totalRecords = payload.items.length;
+  const totalPages = Math.max(1, Math.ceil(totalRecords / pageSize));
+  const start = (Math.min(page, totalPages) - 1) * pageSize;
+  return {
+    ...payload,
+    page,
+    pageSize,
+    totalRecords,
+    totalPages,
+    items: payload.items.slice(start, start + pageSize)
+  };
+}
+
+function getConfiguredSelections() {
+  const selections = [];
+  for (const site of config.sites || []) {
+    const activities = Array.isArray(site.activities) && site.activities.length ? site.activities : [site];
+    for (const activity of activities) {
+      const subactivities = Array.isArray(activity.activities) && activity.activities.length ? activity.activities : [null];
+      for (const subactivity of subactivities) {
+        selections.push(resolveSelectedSite(
+          site.name || site.siteName,
+          activity.name || activity.activityName || '',
+          subactivity?.name || subactivity?.activityName || ''
+        ));
+      }
+    }
+  }
+  return selections.filter(Boolean);
+}
+
+async function warmupCaches() {
+  const selections = getConfiguredSelections();
+  console.log(JSON.stringify({ event: 'cache_warmup_started', sources: selections.length }));
+  for (const selection of selections) {
+    try {
+      await loadSourceSnapshot(selection);
+    } catch (error) {
+      console.warn(JSON.stringify({ event: 'cache_warmup_error', list: selection.listName, message: error.message }));
+    }
+  }
+  console.log(JSON.stringify({ event: 'cache_warmup_finished', sources: sourceListCache.size, items: totalSourceItems() }));
+}
+
 app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
   try {
+    const requestStartedAt = Date.now();
     const siteName = req.query.site || config.sites[0]?.name || config.sites[0]?.siteName;
     const activityName = req.query.activity || '';
     const subActivityName = req.query.subactivity || '';
@@ -936,18 +1157,28 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
 
     const cached = dashboardCache.get(cacheKey);
     if (!shouldRefresh && cached && cached.expiresAt > Date.now()) {
+      cacheMetrics.hits += 1;
       console.log(JSON.stringify({ event: 'cache_hit', requestId: req.requestId, key: cacheKey }));
-      return res.json(cached.payload);
+      return res.json(paginateDashboardPayload(cached.payload, req.query));
     }
 
     if (cached) dashboardCache.delete(cacheKey);
+    cacheMetrics.misses += 1;
 
     const items = await fetchListItems(selectedSite, filters, { forceRefresh: shouldRefresh });
     const comparisonFilters = { ...filters, mes: '', ano: '' };
     const comparisonItems = await fetchListItems(selectedSite, comparisonFilters);
+    const analyticsKey = `analytics:${cacheKey}`;
+    let analytics = !shouldRefresh && analyticsCache.get(analyticsKey)?.expiresAt > Date.now()
+      ? analyticsCache.get(analyticsKey).value
+      : null;
+    const analyticsStartedAt = Date.now();
+    if (!analytics) {
+      analytics = buildExecutiveAnalytics(items, comparisonItems);
+      analyticsCache.set(analyticsKey, { value: analytics, expiresAt: Date.now() + cacheTtlMs });
+    }
     console.log(`[dashboard] items received=${items.length} for ${siteName}/${activityName}`);
     const result = buildResult(items, { includeUploadVisium: Boolean(selectedSite?.fields?.uploadVisium) });
-    const analytics = buildExecutiveAnalytics(items, comparisonItems);
     const payload = {
       site: selectedSite,
       filters,
@@ -964,7 +1195,17 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     };
 
     dashboardCache.set(cacheKey, { payload, expiresAt: Date.now() + cacheTtlMs });
-    res.json(payload);
+    while (dashboardCache.size > 500) dashboardCache.delete(dashboardCache.keys().next().value);
+    const paginationStartedAt = Date.now();
+    const responsePayload = paginateDashboardPayload(payload, req.query);
+    console.log(JSON.stringify({
+      event: 'performance', requestId: req.requestId,
+      cacheMs: 0,
+      analyticsMs: Date.now() - analyticsStartedAt,
+      paginationMs: Date.now() - paginationStartedAt,
+      totalMs: Date.now() - requestStartedAt
+    }));
+    res.json(responsePayload);
   } catch (error) {
     console.error(JSON.stringify({ event: 'dashboard_error', requestId: req.requestId, message: error.message }));
     res.status(500).json({
@@ -981,4 +1222,5 @@ app.use((error, req, res, next) => {
 
 app.listen(port, () => {
   console.log(`Dashboard rodando em http://localhost:${port}`);
+  if (cacheWarmupEnabled) setImmediate(() => warmupCaches().catch((error) => console.error(error)));
 });
