@@ -685,8 +685,7 @@ async function publishSummaryAttachment(pngBuffer) {
     );
   }
 
-  const fileName =
-    `Resumo_${Date.now()}.png`;
+  const fileName = "Resumo.png";;
 
   const uploadResponse = await fetch(
     `https://graph.microsoft.com/v1.0/drives/${drive.id}/root:/DashboardSnapshots/${fileName}:/content`,
