@@ -1172,15 +1172,24 @@ function buildResult(items, options = {}) {
   };
 }
 
-function buildExecutiveAnalytics(items, comparisonItems = items) {
-  let latestDate = null;
+// Data de referência dos períodos: hoje, ou o fim do mês/ano filtrado quando não for o atual.
+// A maior data da lista não é usada, pois pode conter datas futuras.
+function resolveAnalyticsReferenceDate(filters = {}) {
+  const now = new Date();
+  const year = Number(filters.ano) || now.getFullYear();
+  const month = Number(filters.mes) || (year === now.getFullYear() ? now.getMonth() + 1 : 12);
+  if (year === now.getFullYear() && month === now.getMonth() + 1) return now;
+  return new Date(year, month, 0);
+}
+
+function buildExecutiveAnalytics(items, comparisonItems = items, filters = {}) {
+  const referenceDate = resolveAnalyticsReferenceDate(filters);
   const designers = new Map();
   const cities = new Map();
   let topCity = null;
 
   for (const item of items) {
     if (!item.date || Number.isNaN(item.date.getTime())) continue;
-    if (!latestDate || item.date > latestDate) latestDate = item.date;
 
     const peso = Number(item.peso || 1);
     const designer = safeString(item.projetista);
@@ -1193,7 +1202,7 @@ function buildExecutiveAnalytics(items, comparisonItems = items) {
     }
   }
 
-  latestDate = latestDate || new Date();
+  const latestDate = referenceDate;
   const dayStart = new Date(latestDate.getFullYear(), latestDate.getMonth(), latestDate.getDate());
   const previousDayStart = new Date(dayStart);
   previousDayStart.setDate(previousDayStart.getDate() - 1);
@@ -1456,7 +1465,7 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
       : null;
     const analyticsStartedAt = Date.now();
     if (!analytics) {
-      analytics = buildExecutiveAnalytics(items, comparisonItems);
+      analytics = buildExecutiveAnalytics(items, comparisonItems, filters);
       analyticsCache.set(analyticsKey, {
         value: analytics,
         sourceCacheKey: snapshot.sourceCacheKey,
