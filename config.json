@@ -109,6 +109,15 @@
                 "dataConclusao": "ENVIO",
                 "uf": "UF",
                 "cidade": "CIDADE"
+              },
+              "weightSource": {
+                "url": "https://corpclarobr.sharepoint.com/sites/USER-Treinamentos-EquipeInterligao",
+                "listName": "UfCidadeClusterpeso",
+                "fields": {
+                  "uf": "Estado",
+                  "cidade": "Cidade",
+                  "peso": "Peso_x0020_para_x0020_projeto"
+                }
               }
             },
             {
@@ -121,6 +130,15 @@
                 "dataConclusao": "ENVIO",
                 "uf": "UF",
                 "cidade": "CIDADE"
+              },
+              "weightSource": {
+                "url": "https://corpclarobr.sharepoint.com/sites/USER-Treinamentos-EquipeInterligao",
+                "listName": "UfCidadeClusterpeso",
+                "fields": {
+                  "uf": "Estado",
+                  "cidade": "Cidade",
+                  "peso": "Peso_x0020_para_x0020_projeto"
+                }
               }
             },
             {

@@ -14,11 +14,10 @@ Você pode usar o arquivo `config.json` localmente ou, no Render, preencher as v
 
 ### Opção A — arquivo JSON local
 
-Edite o arquivo `config.json` e informe:
+> Nunca grave `tenantId`, `clientId` ou `clientSecret` no `config.json`. Mantenha as credenciais exclusivamente no arquivo `.env`, que já é ignorado pelo Git.
 
-- `tenantId`
-- `clientId`
-- `clientSecret`
+Edite o arquivo `config.json` e informe apenas:
+
 - URL do(s) site(s) SharePoint
 - Nome da lista (`Visium`)
 - Campos internos do SharePoint
@@ -27,9 +26,6 @@ Exemplo:
 
 ```json
 {
-  "tenantId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "clientId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "clientSecret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   "sites": [
     {
       "name": "Equipe Procisacpia",

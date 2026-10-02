@@ -5,6 +5,9 @@ const cors = require('cors');
 
 const app = express();
 const port = process.env.PORT || 3000;
+const cacheTtlMs = Math.max(30, Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
+const rateLimitWindowMs = 60 * 1000;
+const rateLimitMaxRequests = Math.max(10, Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 120);
 
 const configPath = path.join(__dirname, 'config.json');
 
@@ -40,9 +43,63 @@ function loadConfig() {
 
 const config = loadConfig();
 const dashboardCache = new Map();
+const weightSourceCache = new Map();
+const sourceListCache = new Map();
+const requestBuckets = new Map();
+let graphTokenCache = null;
 
+function getPublicConfig(source) {
+  return { sites: Array.isArray(source.sites) ? source.sites : [] };
+}
+
+function applySecurityHeaders(req, res, next) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://rak-5ph3.onrender.com");
+  next();
+}
+
+function rateLimit(req, res, next) {
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const bucket = requestBuckets.get(key);
+  const activeBucket = !bucket || now - bucket.startedAt >= rateLimitWindowMs ? { startedAt: now, requests: 0 } : bucket;
+  activeBucket.requests += 1;
+  requestBuckets.set(key, activeBucket);
+  res.setHeader('RateLimit-Limit', rateLimitMaxRequests);
+  res.setHeader('RateLimit-Remaining', Math.max(0, rateLimitMaxRequests - activeBucket.requests));
+
+  if (activeBucket.requests > rateLimitMaxRequests) {
+    res.setHeader('Retry-After', Math.ceil((rateLimitWindowMs - (now - activeBucket.startedAt)) / 1000));
+    return res.status(429).json({ message: 'Limite de requisições excedido. Tente novamente em instantes.' });
+  }
+
+  next();
+}
+
+function validateDashboardQuery(req, res, next) {
+  const allowedKeys = new Set(['site', 'activity', 'subactivity', 'projetista', 'uf', 'cidade', 'mes', 'ano', 'refresh']);
+  const invalidKey = Object.keys(req.query).find((key) => !allowedKeys.has(key));
+  const invalidText = ['site', 'activity', 'subactivity', 'projetista', 'uf', 'cidade'].find((key) => String(req.query[key] || '').length > 120);
+  const month = String(req.query.mes || '');
+  const year = String(req.query.ano || '');
+
+  if (invalidKey || invalidText || (month && !/^(?:[1-9]|1[0-2])$/.test(month)) || (year && !/^\d{4}$/.test(year))) {
+    return res.status(400).json({ message: 'Parâmetros de filtro inválidos.' });
+  }
+
+  next();
+}
+
+app.use(applySecurityHeaders);
+app.use(rateLimit);
 app.use((req, res, next) => {
-  console.log(`[request] ${req.method} ${req.originalUrl}`);
+  const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  req.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  console.log(JSON.stringify({ event: 'request', requestId, method: req.method, path: req.path }));
   next();
 });
 
@@ -61,14 +118,29 @@ function buildDashboardCacheKey(siteName, activityName, subActivityName, filters
   });
 }
 
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:8000')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 app.use(cors({
-  origin: true,
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origem não permitida pelo CORS.'));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+app.use(express.json({ limit: '8mb' }));
 
 const monthNames = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+const summaryAttachmentTarget = {
+  siteUrl: 'https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia',
+  listName: 'Tabela1',
+  title: 'Resumo',
+  fileName: 'Resumo.png'
+};
 
 function getSiteByName(name) {
   return config.sites.find((site) => (site.name || site.siteName) === name) || config.sites[0];
@@ -136,7 +208,6 @@ function normalizeFieldName(value) {
 function decodeSharePointFieldName(value) {
   return String(value || '')
     .replace(/_x([0-9A-Fa-f]{2,4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-    .replace(/x([0-9A-Fa-f]{2,4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/_x([0-9A-Fa-f]{2,4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/_x([0-9A-Fa-f]{2,4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
@@ -374,6 +445,8 @@ async function readJsonResponse(response) {
 }
 
 async function getGraphToken() {
+  if (graphTokenCache && graphTokenCache.expiresAt > Date.now()) return graphTokenCache.accessToken;
+
   const headers = {
     'Content-Type': 'application/x-www-form-urlencoded'
   };
@@ -393,10 +466,128 @@ async function getGraphToken() {
     throw new Error(`Falha ao obter token do Microsoft Graph: ${data.error_description || JSON.stringify(data)}`);
   }
 
+  graphTokenCache = {
+    accessToken: data.access_token,
+    expiresAt: Date.now() + Math.max(60, Number(data.expires_in || 3600) - 120) * 1000
+  };
+  return graphTokenCache.accessToken;
+}
+
+async function getSharePointToken(siteUrl) {
+  const siteOrigin = new URL(siteUrl).origin;
+  const body = new URLSearchParams({
+    client_id: config.clientId,
+    client_secret: config.clientSecret,
+    scope: `${siteOrigin}/.default`,
+    grant_type: 'client_credentials'
+  });
+  const response = await fetch(`https://login.microsoftonline.com/${config.tenantId}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(`Falha ao obter token do SharePoint: ${data.error_description || data.error || 'sem detalhe'}`);
   return data.access_token;
 }
 
-async function fetchListItems(site, filters = {}) {
+function escapeODataString(value) {
+  return String(value).replace(/'/g, "''");
+}
+
+async function publishSummaryAttachment(pngBuffer) {
+  const { siteUrl, listName, title, fileName } = summaryAttachmentTarget;
+  const token = await getSharePointToken(siteUrl);
+  const listPath = `/_api/web/lists/getbytitle('${escapeODataString(listName)}')`;
+  const headers = { Accept: 'application/json;odata=nometadata', Authorization: `Bearer ${token}` };
+  const itemLookup = await fetch(`${siteUrl}${listPath}/items?$select=Id&$filter=Title eq '${escapeODataString(title)}'&$top=1`, { headers });
+  const lookupData = await readJsonResponse(itemLookup);
+  if (!itemLookup.ok) throw new Error(`Não foi possível localizar a lista ${listName}.`);
+
+  let itemId = Array.isArray(lookupData.value) && lookupData.value[0]?.Id;
+  if (!itemId) {
+    const createResponse = await fetch(`${siteUrl}${listPath}/items`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json;odata=nometadata' },
+      body: JSON.stringify({ Title: title })
+    });
+    const createdItem = await readJsonResponse(createResponse);
+    if (!createResponse.ok || !createdItem.Id) throw new Error(`Não foi possível criar o item ${title} na lista ${listName}.`);
+    itemId = createdItem.Id;
+  }
+
+  const attachmentPath = `${listPath}/items(${itemId})/AttachmentFiles/getbyfilename('${escapeODataString(fileName)}')`;
+  const deleteResponse = await fetch(`${siteUrl}${attachmentPath}`, {
+    method: 'POST',
+    headers: { ...headers, 'IF-MATCH': '*', 'X-HTTP-Method': 'DELETE' }
+  });
+  if (!deleteResponse.ok && deleteResponse.status !== 404) throw new Error('Não foi possível substituir o anexo anterior do resumo.');
+
+  const uploadResponse = await fetch(`${siteUrl}${listPath}/items(${itemId})/AttachmentFiles/add(FileName='${escapeODataString(fileName)}')`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'image/png' },
+    body: pngBuffer
+  });
+  if (!uploadResponse.ok) throw new Error('Não foi possível enviar o PNG do resumo ao SharePoint.');
+  return itemId;
+}
+
+function buildLocationKey(uf, cidade) {
+  return `${safeString(uf)}|${safeString(cidade)}`
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9|]/g, '')
+    .toUpperCase();
+}
+
+async function fetchWeightMap(weightSource) {
+  if (!weightSource?.url || !weightSource?.listName || !weightSource?.fields) return new Map();
+
+  const cacheKey = JSON.stringify(weightSource);
+  const cached = weightSourceCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.weights;
+
+  const sourceUrl = new URL(weightSource.url);
+  const fields = [weightSource.fields.uf, weightSource.fields.cidade, weightSource.fields.peso].filter(Boolean);
+  const token = await getGraphToken();
+  const weights = new Map();
+  const listCandidates = getListNameCandidates(weightSource.listName);
+
+  for (const listName of listCandidates) {
+    const baseUrl = `https://graph.microsoft.com/v1.0/sites/${sourceUrl.hostname}:/${sourceUrl.pathname.replace(/\/$/, '')}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
+    let nextUrl = baseUrl;
+    let loadedAny = false;
+
+    while (nextUrl) {
+      const response = await fetch(nextUrl, {
+        headers: { Accept: 'application/json;odata.metadata=none', Authorization: `Bearer ${token}` }
+      });
+      const payload = await readJsonResponse(response);
+
+      if (!response.ok) {
+        if ([400, 401, 403, 404].includes(response.status)) break;
+        throw new Error(`Erro ao consultar a lista de pesos ${listName}.`);
+      }
+
+      loadedAny = true;
+      (Array.isArray(payload.value) ? payload.value : []).forEach((item) => {
+        const fieldData = item.fields || {};
+        const key = buildLocationKey(getValue(fieldData, weightSource.fields.uf), getValue(fieldData, weightSource.fields.cidade));
+        const peso = parseMetricValue(getValue(fieldData, weightSource.fields.peso));
+        if (key !== '|' && Number.isFinite(peso) && peso > 0) weights.set(key, peso);
+      });
+      nextUrl = payload['@odata.nextLink'] || null;
+    }
+
+    if (loadedAny) break;
+  }
+
+  weightSourceCache.set(cacheKey, { weights, expiresAt: Date.now() + cacheTtlMs });
+  console.log(JSON.stringify({ event: 'weight_source_loaded', list: weightSource.listName, locations: weights.size }));
+  return weights;
+}
+
+async function fetchListItems(site, filters = {}, options = {}) {
   const normalizedSite = normalizeSiteConfig(site);
 
   if (!normalizedSite || !normalizedSite.url || !normalizedSite.listName) {
@@ -405,7 +596,6 @@ async function fetchListItems(site, filters = {}) {
   }
 
   const siteUrl = normalizedSite.url;
-  const token = await getGraphToken();
 
   const fields = [
     normalizedSite.fields.projetista,
@@ -420,44 +610,58 @@ async function fetchListItems(site, filters = {}) {
   const listCandidates = getListNameCandidates(normalizedSite.listName);
   let activeListName = normalizedSite.listName;
   let allItems = [];
+  const sourceCacheKey = JSON.stringify({ url: siteUrl, listName: normalizedSite.listName, fields });
+  const sourceCache = sourceListCache.get(sourceCacheKey);
 
-  for (const listName of listCandidates) {
-    const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
-    let nextUrl = baseUrl;
-    const pageItems = [];
+  if (!options.forceRefresh && sourceCache && sourceCache.expiresAt > Date.now()) {
+    allItems = sourceCache.items;
+    activeListName = sourceCache.activeListName;
+    console.log(JSON.stringify({ event: 'source_cache_hit', list: activeListName, items: allItems.length }));
+  } else {
+    const token = await getGraphToken();
+    for (const listName of listCandidates) {
+      const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteHostname}:/${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=${fields.map((field) => encodeURIComponent(field)).join(',')})&$top=1000`;
+      let nextUrl = baseUrl;
+      const pageItems = [];
 
-    while (nextUrl) {
-      const response = await fetch(nextUrl, {
-        headers: {
-          Accept: 'application/json;odata.metadata=none',
-          Authorization: `Bearer ${token}`
+      while (nextUrl) {
+        const response = await fetch(nextUrl, {
+          headers: {
+            Accept: 'application/json;odata.metadata=none',
+            Authorization: `Bearer ${token}`
+          }
+        });
+
+        const payload = await readJsonResponse(response);
+        console.log(`[SharePoint] list=${listName} page=${pageItems.length + 1} status=${response.status}`);
+
+        if (!response.ok) {
+          const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
+          const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
+
+          if ([400, 401, 403, 404].includes(response.status)) {
+            console.warn(`Lista não encontrada com nome alternativo: ${listName}. Detalhe: ${detail}`);
+            break;
+          }
+
+          throw new Error(`Erro ao consultar lista ${listName}: ${detail}`);
         }
-      });
 
-      const payload = await readJsonResponse(response);
-      console.log(`[SharePoint] list=${listName} page=${pageItems.length + 1} status=${response.status}`);
-
-      if (!response.ok) {
-        const rawText = payload?.rawText || payload?.error?.message || JSON.stringify(payload);
-        const detail = rawText && String(rawText).length > 0 ? String(rawText).slice(0, 400) : 'sem mensagem';
-
-        if ([400, 401, 403, 404].includes(response.status)) {
-          console.warn(`Lista não encontrada com nome alternativo: ${listName}. Detalhe: ${detail}`);
-          break;
-        }
-
-        throw new Error(`Erro ao consultar lista ${listName}: ${detail}`);
+        const items = Array.isArray(payload.value) ? payload.value : [];
+        pageItems.push(...items);
+        nextUrl = payload['@odata.nextLink'] || null;
       }
 
-      const items = Array.isArray(payload.value) ? payload.value : [];
-      pageItems.push(...items);
-      nextUrl = payload['@odata.nextLink'] || null;
+      if (pageItems.length > 0) {
+        allItems = pageItems;
+        activeListName = listName;
+        break;
+      }
     }
 
-    if (pageItems.length > 0) {
-      allItems = pageItems;
-      activeListName = listName;
-      break;
+    if (allItems.length) {
+      sourceListCache.set(sourceCacheKey, { items: allItems, activeListName, expiresAt: Date.now() + cacheTtlMs });
+      console.log(JSON.stringify({ event: 'source_cache_saved', list: activeListName, items: allItems.length, ttlMs: cacheTtlMs }));
     }
   }
 
@@ -472,6 +676,7 @@ async function fetchListItems(site, filters = {}) {
   }
 
   let uploadDebugLogged = false;
+  const weightMap = await fetchWeightMap(normalizedSite.weightSource);
 
   const mappedItems = allItems
     .map((item) => {
@@ -484,6 +689,7 @@ async function fetchListItems(site, filters = {}) {
       const uf = safeString(getValue(fieldData, normalizedSite.fields.uf)).toUpperCase();
       const cidade = safeString(getValue(fieldData, normalizedSite.fields.cidade));
       const projetista = safeString(getValue(fieldData, normalizedSite.fields.projetista));
+      const peso = weightMap.get(buildLocationKey(uf, cidade)) || 1;
 
       const shouldLogProblemActivity = ['Migração', 'MIGRAO', 'Sar Fo', 'Revisões', 'Revises', 'As-Built', 'AsBuilt'].includes(normalizedSite.activityName || normalizedSite.name || '')
         || ['Migração', 'MIGRAO', 'Sar Fo', 'Revisões', 'Revises', 'As-Built', 'AsBuilt'].includes(normalizedSite.listName || '');
@@ -532,6 +738,7 @@ async function fetchListItems(site, filters = {}) {
         uf,
         cidade,
         projetista,
+        peso,
         raw: item
       };
     })
@@ -562,14 +769,15 @@ function buildResult(items, options = {}) {
   const ufs = new Set();
   const cidades = new Set();
   const projetistas = new Set();
-  const doneCount = items.filter((item) => item.date).length;
+  const doneCount = items.filter((item) => item.date).reduce((sum, item) => sum + Number(item.peso || 1), 0);
 
   items.forEach((item) => {
     const nome = safeString(item.projetista).trim();
     const uploadFlag = Number(item.uploadVisium || 0) > 0 ? 1 : 0;
+    const peso = Number(item.peso || 1);
 
     if (!isIgnorableProjetistaName(nome)) {
-      byProjetista[nome] = (byProjetista[nome] || 0) + 1;
+      byProjetista[nome] = (byProjetista[nome] || 0) + peso;
 
       if (includeUploadVisium) {
         byProjetistaUpload[nome] = (byProjetistaUpload[nome] || 0) + uploadFlag;
@@ -580,7 +788,7 @@ function buildResult(items, options = {}) {
 
     if (item.date) {
       const monthIndex = item.date.getMonth();
-      byMonth[monthIndex].total += 1;
+      byMonth[monthIndex].total += peso;
       years.add(item.date.getFullYear());
     }
 
@@ -598,7 +806,7 @@ function buildResult(items, options = {}) {
     .slice(0, 15);
 
   const summary = {
-    total: items.length,
+    total: items.reduce((sum, item) => sum + Number(item.peso || 1), 0),
     done: doneCount,
     uploadVisiumTotal,
     uniqueProjetistas: Object.keys(byProjetista).length,
@@ -618,6 +826,65 @@ function buildResult(items, options = {}) {
   };
 }
 
+function buildExecutiveAnalytics(items, comparisonItems = items) {
+  const datedItems = items.filter((item) => item.date);
+  const comparisonDates = comparisonItems
+    .filter((item) => !Number.isNaN(item.date.getTime()))
+    .map((item) => ({ date: item.date, peso: Number(item.peso || 1) }));
+  const latestDates = datedItems.filter((item) => !Number.isNaN(item.date.getTime()));
+  const latestDate = latestDates.length ? new Date(Math.max(...latestDates.map((item) => item.date.getTime()))) : new Date();
+  const dayStart = new Date(latestDate.getFullYear(), latestDate.getMonth(), latestDate.getDate());
+  const previousDayStart = new Date(dayStart);
+  previousDayStart.setDate(previousDayStart.getDate() - 1);
+  const weekStart = new Date(dayStart);
+  weekStart.setDate(weekStart.getDate() - 6);
+  const monthStart = new Date(dayStart.getFullYear(), dayStart.getMonth(), 1);
+  const previousMonthStart = new Date(dayStart.getFullYear(), dayStart.getMonth() - 1, 1);
+  const designers = new Map();
+  const cities = new Map();
+  const countBetween = (start, end) => comparisonDates
+    .filter((item) => item.date >= start && item.date < end)
+    .reduce((sum, item) => sum + item.peso, 0);
+
+  datedItems.forEach((item) => {
+    const designer = safeString(item.projetista);
+    const city = safeString(item.cidade);
+    const peso = Number(item.peso || 1);
+
+    if (!isIgnorableProjetistaName(designer)) designers.set(designer, (designers.get(designer) || 0) + peso);
+    if (city) cities.set(city, (cities.get(city) || 0) + peso);
+  });
+
+  const dayTotal = countBetween(dayStart, new Date(dayStart.getTime() + 86400000));
+  const previousDayTotal = countBetween(previousDayStart, dayStart);
+  const weekTotal = countBetween(weekStart, new Date(dayStart.getTime() + 86400000));
+  const monthTotal = countBetween(monthStart, new Date(dayStart.getTime() + 86400000));
+  const previousMonthTotal = countBetween(previousMonthStart, monthStart);
+  const elapsedDays = Math.max(1, Math.floor((dayStart - monthStart) / 86400000) + 1);
+  const daysInMonth = new Date(dayStart.getFullYear(), dayStart.getMonth() + 1, 0).getDate();
+
+  return {
+    generatedAt: new Date().toISOString(),
+    latestDate: latestDate.toISOString(),
+    period: {
+      dayTotal,
+      previousDayTotal,
+      weekTotal,
+      monthTotal,
+      previousMonthTotal,
+      projectedMonthTotal: Math.round((monthTotal / elapsedDays) * daysInMonth)
+    },
+    activeDesigners: designers.size,
+    ranking: Array.from(designers.entries())
+      .map(([name, total]) => ({ name, total }))
+      .sort((left, right) => right.total - left.total)
+      .slice(0, 10),
+    topCity: Array.from(cities.entries())
+      .map(([name, total]) => ({ name, total }))
+      .sort((left, right) => right.total - left.total)[0] || null
+  };
+}
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/health', (_, res) => {
@@ -625,10 +892,30 @@ app.get('/health', (_, res) => {
 });
 
 app.get('/api/config', (_, res) => {
-  res.json(config);
+  res.json(getPublicConfig(config));
 });
 
-app.get('/api/dashboard', async (req, res) => {
+app.post('/api/reports/summary-snapshot', async (req, res) => {
+  try {
+    const pngDataUrl = String(req.body?.pngDataUrl || '');
+    const match = pngDataUrl.match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/);
+    if (!match) return res.status(400).json({ message: 'O resumo precisa ser enviado como imagem PNG.' });
+
+    const pngBuffer = Buffer.from(match[1], 'base64');
+    if (!pngBuffer.length || pngBuffer.length > 6 * 1024 * 1024) {
+      return res.status(400).json({ message: 'O PNG do resumo está vazio ou excede 6 MB.' });
+    }
+
+    const itemId = await publishSummaryAttachment(pngBuffer);
+    console.log(JSON.stringify({ event: 'summary_snapshot_published', requestId: req.requestId, itemId }));
+    res.status(201).json({ ok: true, itemId });
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'summary_snapshot_error', requestId: req.requestId, message: error.message }));
+    res.status(502).json({ message: 'Não foi possível publicar o resumo no SharePoint.', requestId: req.requestId });
+  }
+});
+
+app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
   try {
     const siteName = req.query.site || config.sites[0]?.name || config.sites[0]?.siteName;
     const activityName = req.query.activity || '';
@@ -647,14 +934,20 @@ app.get('/api/dashboard', async (req, res) => {
 
     console.log(`[dashboard] site=${siteName} activity=${activityName} subactivity=${subActivityName} refresh=${shouldRefresh} filters=${JSON.stringify(filters)}`);
 
-    if (!shouldRefresh && dashboardCache.has(cacheKey)) {
-      console.log(`[cache] using cached dashboard for ${cacheKey}`);
-      return res.json(dashboardCache.get(cacheKey));
+    const cached = dashboardCache.get(cacheKey);
+    if (!shouldRefresh && cached && cached.expiresAt > Date.now()) {
+      console.log(JSON.stringify({ event: 'cache_hit', requestId: req.requestId, key: cacheKey }));
+      return res.json(cached.payload);
     }
 
-    const items = await fetchListItems(selectedSite, filters);
+    if (cached) dashboardCache.delete(cacheKey);
+
+    const items = await fetchListItems(selectedSite, filters, { forceRefresh: shouldRefresh });
+    const comparisonFilters = { ...filters, mes: '', ano: '' };
+    const comparisonItems = await fetchListItems(selectedSite, comparisonFilters);
     console.log(`[dashboard] items received=${items.length} for ${siteName}/${activityName}`);
     const result = buildResult(items, { includeUploadVisium: Boolean(selectedSite?.fields?.uploadVisium) });
+    const analytics = buildExecutiveAnalytics(items, comparisonItems);
     const payload = {
       site: selectedSite,
       filters,
@@ -663,20 +956,27 @@ app.get('/api/dashboard', async (req, res) => {
         uf: item.uf || '',
         cidade: item.cidade || '',
         uploadVisium: Number(item.uploadVisium || 0),
+          peso: Number(item.peso || 1),
         date: item.date ? item.date.toISOString() : null
       })),
-      ...result
+      ...result,
+      analytics
     };
 
-    dashboardCache.set(cacheKey, payload);
+    dashboardCache.set(cacheKey, { payload, expiresAt: Date.now() + cacheTtlMs });
     res.json(payload);
   } catch (error) {
-    console.error(error);
+    console.error(JSON.stringify({ event: 'dashboard_error', requestId: req.requestId, message: error.message }));
     res.status(500).json({
       message: 'Erro ao carregar dados do SharePoint.',
-      detail: error.message
+      requestId: req.requestId
     });
   }
+});
+
+app.use((error, req, res, next) => {
+  console.error(JSON.stringify({ event: 'unhandled_error', requestId: req.requestId, message: error.message }));
+  res.status(500).json({ message: 'Erro interno do servidor.', requestId: req.requestId });
 });
 
 app.listen(port, () => {
