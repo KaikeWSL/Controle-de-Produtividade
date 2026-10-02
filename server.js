@@ -616,12 +616,21 @@ async function getSharePointToken(siteUrl) {
     body
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(`Falha ao obter token do SharePoint: ${data.error_description || data.error || 'sem detalhe'}`);
+  if (!response.ok) throw new Error(`Falha ao obter token do SharePoint: ${String(data.error_description || data.error || 'sem detalhe').split('\r\n')[0]}`);
   return data.access_token;
 }
 
 function escapeODataString(value) {
   return String(value).replace(/'/g, "''");
+}
+
+// Monta mensagem de erro com etapa e status HTTP, sem expor tokens.
+function describeSharePointError(step, response, payload) {
+  const detail = payload?.error?.message?.value || payload?.error?.message || payload?.error_description || payload?.rawText || '';
+  const hint = response.status === 401 || response.status === 403
+    ? ' (o SharePoint REST costuma recusar tokens app-only baseados em client secret; use certificado ou conceda acesso à lista)'
+    : '';
+  return `${step}: HTTP ${response.status} ${String(detail).slice(0, 200)}${hint}`.trim();
 }
 
 async function publishSummaryAttachment(pngBuffer) {
@@ -631,7 +640,7 @@ async function publishSummaryAttachment(pngBuffer) {
   const headers = { Accept: 'application/json;odata=nometadata', Authorization: `Bearer ${token}` };
   const itemLookup = await fetch(`${siteUrl}${listPath}/items?$select=Id&$filter=Title eq '${escapeODataString(title)}'&$top=1`, { headers });
   const lookupData = await readJsonResponse(itemLookup);
-  if (!itemLookup.ok) throw new Error(`Não foi possível localizar a lista ${listName}.`);
+  if (!itemLookup.ok) throw new Error(describeSharePointError(`Localizar lista ${listName}`, itemLookup, lookupData));
 
   let itemId = Array.isArray(lookupData.value) && lookupData.value[0]?.Id;
   if (!itemId) {
@@ -641,7 +650,7 @@ async function publishSummaryAttachment(pngBuffer) {
       body: JSON.stringify({ Title: title })
     });
     const createdItem = await readJsonResponse(createResponse);
-    if (!createResponse.ok || !createdItem.Id) throw new Error(`Não foi possível criar o item ${title} na lista ${listName}.`);
+    if (!createResponse.ok || !createdItem.Id) throw new Error(describeSharePointError(`Criar item ${title}`, createResponse, createdItem));
     itemId = createdItem.Id;
   }
 
@@ -650,14 +659,14 @@ async function publishSummaryAttachment(pngBuffer) {
     method: 'POST',
     headers: { ...headers, 'IF-MATCH': '*', 'X-HTTP-Method': 'DELETE' }
   });
-  if (!deleteResponse.ok && deleteResponse.status !== 404) throw new Error('Não foi possível substituir o anexo anterior do resumo.');
+  if (!deleteResponse.ok && deleteResponse.status !== 404) throw new Error(describeSharePointError('Remover anexo anterior', deleteResponse, await readJsonResponse(deleteResponse)));
 
   const uploadResponse = await fetch(`${siteUrl}${listPath}/items(${itemId})/AttachmentFiles/add(FileName='${escapeODataString(fileName)}')`, {
     method: 'POST',
     headers: { ...headers, 'Content-Type': 'image/png' },
     body: pngBuffer
   });
-  if (!uploadResponse.ok) throw new Error('Não foi possível enviar o PNG do resumo ao SharePoint.');
+  if (!uploadResponse.ok) throw new Error(describeSharePointError('Enviar anexo', uploadResponse, await readJsonResponse(uploadResponse)));
   return itemId;
 }
 
@@ -1307,7 +1316,7 @@ app.post('/api/reports/summary-snapshot', async (req, res) => {
     res.status(201).json({ ok: true, itemId });
   } catch (error) {
     console.error(JSON.stringify({ event: 'summary_snapshot_error', requestId: req.requestId, message: error.message }));
-    res.status(502).json({ message: 'Não foi possível publicar o resumo no SharePoint.', requestId: req.requestId });
+    res.status(502).json({ message: 'Não foi possível publicar o resumo no SharePoint.', detail: error.message, requestId: req.requestId });
   }
 });
 
