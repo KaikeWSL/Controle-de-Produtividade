@@ -634,40 +634,82 @@ function describeSharePointError(step, response, payload) {
 }
 
 async function publishSummaryAttachment(pngBuffer) {
-  const { siteUrl, listName, title, fileName } = summaryAttachmentTarget;
-  const token = await getSharePointToken(siteUrl);
-  const listPath = `/_api/web/lists/getbytitle('${escapeODataString(listName)}')`;
-  const headers = { Accept: 'application/json;odata=nometadata', Authorization: `Bearer ${token}` };
-  const itemLookup = await fetch(`${siteUrl}${listPath}/items?$select=Id&$filter=Title eq '${escapeODataString(title)}'&$top=1`, { headers });
-  const lookupData = await readJsonResponse(itemLookup);
-  if (!itemLookup.ok) throw new Error(describeSharePointError(`Localizar lista ${listName}`, itemLookup, lookupData));
 
-  let itemId = Array.isArray(lookupData.value) && lookupData.value[0]?.Id;
-  if (!itemId) {
-    const createResponse = await fetch(`${siteUrl}${listPath}/items`, {
-      method: 'POST',
-      headers: { ...headers, 'Content-Type': 'application/json;odata=nometadata' },
-      body: JSON.stringify({ Title: title })
-    });
-    const createdItem = await readJsonResponse(createResponse);
-    if (!createResponse.ok || !createdItem.Id) throw new Error(describeSharePointError(`Criar item ${title}`, createResponse, createdItem));
-    itemId = createdItem.Id;
+  const token = await getGraphToken();
+
+  const sitePath = "sites/USER-USER-EquipeProcisacpia";
+  const hostname = "corpclarobr.sharepoint.com";
+
+  // Obtém Site ID
+  const siteResponse = await fetch(
+    `https://graph.microsoft.com/v1.0/sites/${hostname}:/${sitePath}`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    }
+  );
+
+  const siteData = await siteResponse.json();
+
+  if (!siteResponse.ok) {
+    throw new Error(`Erro ao localizar Site: ${JSON.stringify(siteData)}`);
   }
 
-  const attachmentPath = `${listPath}/items(${itemId})/AttachmentFiles/getbyfilename('${escapeODataString(fileName)}')`;
-  const deleteResponse = await fetch(`${siteUrl}${attachmentPath}`, {
-    method: 'POST',
-    headers: { ...headers, 'IF-MATCH': '*', 'X-HTTP-Method': 'DELETE' }
-  });
-  if (!deleteResponse.ok && deleteResponse.status !== 404) throw new Error(describeSharePointError('Remover anexo anterior', deleteResponse, await readJsonResponse(deleteResponse)));
+  const siteId = siteData.id;
 
-  const uploadResponse = await fetch(`${siteUrl}${listPath}/items(${itemId})/AttachmentFiles/add(FileName='${escapeODataString(fileName)}')`, {
-    method: 'POST',
-    headers: { ...headers, 'Content-Type': 'image/png' },
-    body: pngBuffer
-  });
-  if (!uploadResponse.ok) throw new Error(describeSharePointError('Enviar anexo', uploadResponse, await readJsonResponse(uploadResponse)));
-  return itemId;
+  // Biblioteca onde o PNG será salvo
+  const driveResponse = await fetch(
+    `https://graph.microsoft.com/v1.0/sites/${siteId}/drives`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    }
+  );
+
+  const driveData = await driveResponse.json();
+
+  if (!driveResponse.ok) {
+    throw new Error(`Erro ao localizar biblioteca.`);
+  }
+
+  const drive =
+    driveData.value.find(
+      d => d.name === "Documentos"
+    );
+
+  if (!drive) {
+    throw new Error(
+      "Biblioteca DashboardSnapshots não encontrada."
+    );
+  }
+
+  const fileName =
+    `Resumo_${Date.now()}.png`;
+
+  const uploadResponse = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${drive.id}/root:/DashboardSnapshots/${fileName}:/content`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "image/png"
+      },
+      body: pngBuffer
+    }
+  );
+
+  const uploadData =
+    await uploadResponse.json();
+
+  if (!uploadResponse.ok) {
+    throw new Error(
+      `Erro ao enviar imagem: ${JSON.stringify(uploadData)}`
+    );
+  }
+
+  return uploadData.id;
 }
 
 function buildLocationKey(uf, cidade) {
