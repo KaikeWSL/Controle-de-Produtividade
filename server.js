@@ -8,7 +8,7 @@ const compression = require('compression');
 
 const app = express();
 const port = process.env.PORT || 3000;
-const cacheTtlMs = Math.max(30, Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
+const cacheTtlMs = null;
 const cacheMaxItems = Math.max(1000, Number(process.env.CACHE_MAX_ITEMS) || 100000);
 const cacheCleanupIntervalMs = Math.max(30, Number(process.env.CACHE_CLEANUP_INTERVAL) || 60) * 1000;
 const cacheWarmupEnabled = String(process.env.CACHE_WARMUP_ENABLED || 'true').toLowerCase() !== 'false';
@@ -209,32 +209,29 @@ function removeSourceSnapshot(sourceCacheKey) {
 }
 
 function evictSourceCache() {
-  const now = Date.now();
-  for (const [key, entry] of sourceListCache) {
-    if (entry.expiresAt <= now) removeSourceSnapshot(key);
+
+  while (
+      totalCachedItems() > cacheMaxItems &&
+      sourceProfileCache.size
+  ) {
+      sourceProfileCache.delete(
+          sourceProfileCache.keys().next().value
+      );
   }
-  for (const [key, entry] of sourceProfileCache) {
-    if (entry.expiresAt <= now) sourceProfileCache.delete(key);
-  }
-  while (totalCachedItems() > cacheMaxItems && sourceProfileCache.size) {
-    sourceProfileCache.delete(sourceProfileCache.keys().next().value);
-  }
-  while (totalCachedItems() > cacheMaxItems && sourceListCache.size) {
-    removeSourceSnapshot(sourceListCache.keys().next().value);
+
+  while (
+      totalCachedItems() > cacheMaxItems &&
+      sourceListCache.size
+  ) {
+      removeSourceSnapshot(
+          sourceListCache.keys().next().value
+      );
   }
 }
 
 function cleanupCaches() {
-  const now = Date.now();
-  [dashboardCache, weightSourceCache, analyticsCache].forEach((cache) => {
-    for (const [key, entry] of cache) {
-      if (entry.expiresAt <= now) cache.delete(key);
-    }
-  });
-  evictSourceCache();
+    evictSourceCache();
 }
-
-setInterval(cleanupCaches, cacheCleanupIntervalMs).unref();
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:8000')
   .split(',')
@@ -724,7 +721,13 @@ async function fetchWeightMap(weightSource, options = {}) {
 
   const cacheKey = JSON.stringify(weightSource);
   const cached = weightSourceCache.get(cacheKey);
-  if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) return cached.weights;
+
+    if (
+        !options.forceRefresh &&
+        cached
+    ) {
+        return cached.weights;
+    }
   if (weightLoadPromises.has(cacheKey)) {
     cacheMetrics.weightLoadDeduplications += 1;
     return weightLoadPromises.get(cacheKey);
@@ -766,7 +769,12 @@ async function fetchWeightMap(weightSource, options = {}) {
       if (loadedAny) break;
     }
 
-    weightSourceCache.set(cacheKey, { weights, expiresAt: Date.now() + cacheTtlMs });
+    weightSourceCache.set(
+      cacheKey,
+      {
+          weights
+      }
+    );
     console.log(JSON.stringify({ event: 'weight_source_loaded', list: weightSource.listName, locations: weights.size }));
     return weights;
   })();
@@ -809,7 +817,7 @@ function createRawSourceSnapshot(items, activeListName, cacheKey, fields) {
     activeListName,
     fields,
     items,
-    expiresAt: Date.now() + cacheTtlMs,
+    expiresAt: null,
     createdAt: Date.now(),
     lastAccessedAt: Date.now()
   };
@@ -864,10 +872,19 @@ function serializeSourceSnapshot(snapshot) {
 }
 
 function hydrateSourceSnapshot(data, cacheKey) {
-  if (!data || data.version !== 2 || !Array.isArray(data.items) || data.expiresAt <= Date.now()) return null;
-  const snapshot = createRawSourceSnapshot(data.items, data.activeListName, cacheKey, data.fields || []);
-  snapshot.expiresAt = data.expiresAt;
+  if (!data || data.version !== 2 || !Array.isArray(data.items)) {
+    return null;
+  }
+
+  const snapshot = createRawSourceSnapshot(
+    data.items,
+    data.activeListName,
+    cacheKey,
+    data.fields || []
+  );
+
   snapshot.createdAt = data.createdAt || Date.now();
+
   return snapshot;
 }
 
@@ -952,7 +969,10 @@ async function loadRawSourceSnapshot(site, options = {}) {
 
   const sourceCacheKey = buildPhysicalSourceCacheKey(normalizedSite);
   const cached = sourceListCache.get(sourceCacheKey);
-  if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) {
+  if (
+    !options.forceRefresh &&
+    cached
+    ){
     cacheMetrics.hits += 1;
     return touchCacheEntry(sourceListCache, sourceCacheKey, cached);
   }
@@ -1097,12 +1117,22 @@ function createProfileItems(rawItems, site, weightMap) {
 async function loadSourceSnapshot(site, options = {}) {
   const normalizedSite = normalizeSiteConfig(site);
   if (!normalizedSite || !normalizedSite.url || !normalizedSite.listName) {
-    return createSourceProfileSnapshot([], '', 'invalid', 'invalid', Date.now() + cacheTtlMs, Date.now());
+    return createSourceProfileSnapshot(
+    [],
+    '',
+    'invalid',
+    'invalid',
+    null,
+    Date.now()
+    );
   }
 
   const profileCacheKey = buildSourceProfileCacheKey(normalizedSite);
   const cached = sourceProfileCache.get(profileCacheKey);
-  if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) {
+  if (
+    !options.forceRefresh &&
+    cached
+    ) {
     cacheMetrics.hits += 1;
     return touchCacheEntry(sourceProfileCache, profileCacheKey, cached);
   }
@@ -1248,7 +1278,8 @@ function buildExecutiveAnalytics(items, comparisonItems = items, filters = {}) {
   const previousDayStart = new Date(dayStart);
   previousDayStart.setDate(previousDayStart.getDate() - 1);
   const weekStart = new Date(dayStart);
-  weekStart.setDate(weekStart.getDate() - 6);
+  const weekday = weekStart.getDay();
+  weekStart.setDate(weekStart.getDate() - (weekday === 0 ? 6 : weekday - 1));
   const monthStart = new Date(dayStart.getFullYear(), dayStart.getMonth(), 1);
   const previousMonthStart = new Date(dayStart.getFullYear(), dayStart.getMonth() - 1, 1);
   let dayTotal = 0;
@@ -1469,7 +1500,10 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     console.log(`[dashboard] site=${siteName} activity=${activityName} subactivity=${subActivityName} refresh=${shouldRefresh} filters=${JSON.stringify(filters)}`);
 
     const cached = dashboardCache.get(cacheKey);
-    if (!shouldRefresh && cached && cached.expiresAt > Date.now()) {
+    if (
+    !shouldRefresh &&
+    cached
+      ) {
       cacheMetrics.hits += 1;
       console.log(JSON.stringify({ event: 'cache_hit', requestId: req.requestId, key: cacheKey }));
       const paginationStartedAt = Date.now();
@@ -1501,7 +1535,7 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     const filterMs = Date.now() - filteringStartedAt;
     const analyticsKey = `analytics:${cacheKey}`;
     const cachedAnalytics = !shouldRefresh ? analyticsCache.get(analyticsKey) : null;
-    let analytics = cachedAnalytics && cachedAnalytics.expiresAt > Date.now()
+    let analytics = cachedAnalytics
       ? touchCacheEntry(analyticsCache, analyticsKey, cachedAnalytics).value
       : null;
     const analyticsStartedAt = Date.now();
@@ -1510,7 +1544,7 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
       analyticsCache.set(analyticsKey, {
         value: analytics,
         sourceCacheKey: snapshot.sourceCacheKey,
-        expiresAt: Date.now() + cacheTtlMs,
+        expiresAt: null,
         lastAccessedAt: Date.now()
       });
     }
@@ -1537,7 +1571,7 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     dashboardCache.set(cacheKey, {
       payload,
       sourceCacheKey: snapshot.sourceCacheKey,
-      expiresAt: Date.now() + cacheTtlMs,
+      expiresAt: null,
       lastAccessedAt: Date.now()
     });
     while (dashboardCache.size > dashboardCacheMaxEntries) dashboardCache.delete(dashboardCache.keys().next().value);
