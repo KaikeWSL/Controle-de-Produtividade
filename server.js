@@ -52,6 +52,11 @@ function loadConfig() {
 }
 
 const config = loadConfig();
+app.use((req, res, next) => {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  req.isHttps = isHttps;
+  next();
+});
 app.use(session({
   name: 'dashboard.sid',
   secret: process.env.SESSION_SECRET || 'dashboard-session-secret',
@@ -60,7 +65,10 @@ app.use(session({
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
-    secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
+    secure: (() => {
+      const secureEnv = String(process.env.NODE_ENV || '').toLowerCase();
+      return secureEnv === 'production' || process.env.SESSION_SECURE === 'true';
+    })(),
     maxAge: 1000 * 60 * 60 * 8
   }
 }));
@@ -97,12 +105,15 @@ function normalizeUserName(value) {
   return String(value).replace(/\s+/g, ' ').trim();
 }
 
-function getMicrosoftAuthConfig() {
+function getMicrosoftAuthConfig(req = null) {
+  const requestedHost = req ? `${req.protocol}://${req.get('host')}` : `http://localhost:${port}`;
+  const redirectUri = process.env.MICROSOFT_REDIRECT_URI || `${requestedHost}/api/auth/callback`;
+
   return {
     tenantId: process.env.TENANT_ID || config.tenantId || '',
     clientId: process.env.CLIENT_ID || config.clientId || '',
     clientSecret: process.env.CLIENT_SECRET || config.clientSecret || '',
-    redirectUri: process.env.MICROSOFT_REDIRECT_URI || `http://localhost:${port}/api/auth/callback`
+    redirectUri
   };
 }
 
@@ -1369,7 +1380,7 @@ app.get('/health', (_, res) => {
 });
 
 app.get('/api/auth/login', (req, res) => {
-  const { tenantId, clientId, redirectUri } = getMicrosoftAuthConfig();
+  const { tenantId, clientId, redirectUri } = getMicrosoftAuthConfig(req);
   if (!isMicrosoftAuthConfigured()) {
     return res.status(503).json({ message: 'Login da Microsoft não configurado. Defina TENANT_ID, CLIENT_ID, CLIENT_SECRET e MICROSOFT_REDIRECT_URI.' });
   }
@@ -1398,7 +1409,7 @@ app.get('/api/auth/callback', async (req, res) => {
       return res.status(400).send('State inválido ou expirado.');
     }
 
-    const { tenantId, clientId, clientSecret, redirectUri } = getMicrosoftAuthConfig();
+    const { tenantId, clientId, clientSecret, redirectUri } = getMicrosoftAuthConfig(req);
     const tokenResponse = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
