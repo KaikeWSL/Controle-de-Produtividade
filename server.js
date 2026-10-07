@@ -5,8 +5,11 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const cors = require('cors');
 const compression = require('compression');
+const session = require('express-session');
 
 const app = express();
+app.set('trust proxy', 1);
+const authStateStore = new Map();
 const port = process.env.PORT || 3000;
 const cacheTtlMs = null;
 const cacheMaxItems = Math.max(1000, Number(process.env.CACHE_MAX_ITEMS) || 100000);
@@ -49,6 +52,18 @@ function loadConfig() {
 }
 
 const config = loadConfig();
+app.use(session({
+  name: 'dashboard.sid',
+  secret: process.env.SESSION_SECRET || 'dashboard-session-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
+    maxAge: 1000 * 60 * 60 * 8
+  }
+}));
 const dashboardCache = new Map();
 const weightSourceCache = new Map();
 const sourceListCache = new Map();
@@ -75,6 +90,25 @@ fs.mkdirSync(cacheDirectory, { recursive: true });
 
 function getPublicConfig(source) {
   return { sites: Array.isArray(source.sites) ? source.sites : [] };
+}
+
+function normalizeUserName(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/\s+/g, ' ').trim();
+}
+
+function getMicrosoftAuthConfig() {
+  return {
+    tenantId: process.env.TENANT_ID || config.tenantId || '',
+    clientId: process.env.CLIENT_ID || config.clientId || '',
+    clientSecret: process.env.CLIENT_SECRET || config.clientSecret || '',
+    redirectUri: process.env.MICROSOFT_REDIRECT_URI || `http://localhost:${port}/api/auth/callback`
+  };
+}
+
+function isMicrosoftAuthConfigured() {
+  const { tenantId, clientId, clientSecret } = getMicrosoftAuthConfig();
+  return Boolean(tenantId && clientId && clientSecret);
 }
 
 function applySecurityHeaders(req, res, next) {
@@ -1328,6 +1362,93 @@ app.get('/health', (_, res) => {
   res.json({ ok: true, service: 'sharepoint-dashboard', sites: config.sites?.length || 0 });
 });
 
+app.get('/api/auth/login', (req, res) => {
+  const { tenantId, clientId, redirectUri } = getMicrosoftAuthConfig();
+  if (!isMicrosoftAuthConfigured()) {
+    return res.status(503).json({ message: 'Login da Microsoft não configurado. Defina TENANT_ID, CLIENT_ID, CLIENT_SECRET e MICROSOFT_REDIRECT_URI.' });
+  }
+
+  const state = crypto.randomBytes(16).toString('hex');
+  authStateStore.set(state, { createdAt: Date.now() });
+  const authUrl = new URL(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize`);
+  authUrl.searchParams.set('client_id', clientId);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('response_mode', 'query');
+  authUrl.searchParams.set('scope', 'openid profile email User.Read');
+  authUrl.searchParams.set('state', state);
+
+  return res.redirect(authUrl.toString());
+});
+
+app.get('/api/auth/callback', async (req, res) => {
+  try {
+    const { code, state, error, error_description } = req.query;
+    if (error) {
+      return res.status(400).send(`Autenticação cancelada: ${error_description || error}`);
+    }
+
+    if (!state || !authStateStore.has(String(state))) {
+      return res.status(400).send('State inválido ou expirado.');
+    }
+
+    const { tenantId, clientId, clientSecret, redirectUri } = getMicrosoftAuthConfig();
+    const tokenResponse = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        code: String(code || ''),
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+        scope: 'openid profile email User.Read'
+      }).toString()
+    });
+
+    const tokenData = await tokenResponse.json();
+    if (!tokenResponse.ok || !tokenData.access_token) {
+      throw new Error(tokenData.error_description || 'Falha ao trocar o código por token Microsoft.');
+    }
+
+    const profileResponse = await fetch('https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName', {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`
+      }
+    });
+
+    const profileData = await profileResponse.json();
+    if (!profileResponse.ok) {
+      throw new Error(profileData.error?.message || 'Não foi possível obter o perfil do usuário no Microsoft Graph.');
+    }
+
+    req.session.user = {
+      displayName: normalizeUserName(profileData.displayName || profileData.userPrincipalName || profileData.mail || ''),
+      mail: normalizeUserName(profileData.mail || ''),
+      userPrincipalName: normalizeUserName(profileData.userPrincipalName || ''),
+      authenticatedAt: new Date().toISOString()
+    };
+
+    authStateStore.delete(String(state));
+    return res.redirect('/');
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'microsoft_auth_error', requestId: req.requestId, message: error.message }));
+    return res.status(500).send(`Erro na autenticação com Microsoft: ${error.message}`);
+  }
+});
+
+app.get('/api/auth/user', (req, res) => {
+  res.json({
+    user: req.session?.user || null
+  });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.json({ ok: true });
+  });
+});
+
 app.get('/api/config', (_, res) => {
   res.json(getPublicConfig(config));
 });
@@ -1486,8 +1607,9 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     const activityName = req.query.activity || '';
     const subActivityName = req.query.subactivity || '';
     const selectedSite = resolveSelectedSite(siteName, activityName, subActivityName);
+    const sessionUserName = req.session?.user ? normalizeUserName(req.session.user.displayName || req.session.user.userPrincipalName || req.session.user.mail || '') : '';
     const filters = {
-      projetista: req.query.projetista || '',
+      projetista: sessionUserName || req.query.projetista || '',
       uf: req.query.uf || '',
       cidade: req.query.cidade || '',
       mes: req.query.mes || '',
