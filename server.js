@@ -267,14 +267,20 @@ function cleanupCaches() {
     evictSourceCache();
 }
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:8000')
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:8000,https://controleprodutividade.netlify.app,https://www.controleprodutividade.netlify.app')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  if (allowedOrigins.includes(origin)) return true;
+  return /https?:\/\/.*\.netlify\.app$/i.test(origin) || /https?:\/\/.*\.netlify\.app\//i.test(origin);
+}
+
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    if (isAllowedOrigin(origin)) return callback(null, true);
     return callback(new Error('Origem não permitida pelo CORS.'));
   },
   credentials: true,
