@@ -471,16 +471,11 @@ function normalizePerfilValue(value) {
   return safeString(value || '').toUpperCase();
 }
 
-async function getAuthenticatedUserByToken(token) {
-  const userToken = safeString(token).trim();
-  if (!userToken) return null;
-
+async function listCollaborators() {
   const authSiteUrl = 'https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia';
   const siteUrl = new URL(authSiteUrl);
   const sitePath = siteUrl.pathname.replace(/\/$/, '');
-  const tokenValue = userToken;
   const listNames = getListNameCandidates('Colaborador');
-
   if (!listNames.length) listNames.push('Colaborador');
 
   for (const listName of listNames) {
@@ -501,27 +496,31 @@ async function getAuthenticatedUserByToken(token) {
 
     const payload = await readJsonResponse(response);
     const items = Array.isArray(payload.value) ? payload.value : [];
-    const match = items.find((item) => {
-      const candidateToken = safeString(getValue(item.fields || item, 'Token'));
-      return candidateToken === tokenValue;
+
+    return items.map((item) => {
+      const fields = item.fields || item;
+      const nome = safeString(getValue(fields, 'Nome_x0020_completo') || getValue(fields, 'Nome completo') || getValue(fields, 'Nome') || '');
+      const email = safeString(getValue(fields, 'Email') || getValue(fields, 'E_mail') || getValue(fields, 'eMail') || '');
+      const perfil = normalizePerfilValue(getValue(fields, 'Perfil') || 'PROJETISTA');
+      const token = safeString(getValue(fields, 'Token') || '');
+      return {
+        token,
+        nome: nome || 'Colaborador',
+        email,
+        perfil: perfil || 'PROJETISTA'
+      };
     });
-
-    if (!match) continue;
-
-    const fields = match.fields || match;
-    const nome = safeString(getValue(fields, 'Nome_x0020_completo') || getValue(fields, 'Nome completo') || getValue(fields, 'Nome') || '');
-    const email = safeString(getValue(fields, 'Email') || getValue(fields, 'E_mail') || getValue(fields, 'eMail') || '');
-    const perfil = normalizePerfilValue(getValue(fields, 'Perfil') || 'PROJETISTA');
-
-    return {
-      token: tokenValue,
-      nome: nome || 'Colaborador',
-      email,
-      perfil: perfil || 'PROJETISTA'
-    };
   }
 
-  return null;
+  return [];
+}
+
+async function getAuthenticatedUserByToken(token) {
+  const userToken = safeString(token).trim();
+  if (!userToken) return null;
+
+  const collaborators = await listCollaborators();
+  return collaborators.find((user) => user.token === userToken) || null;
 }
 
 function getAccessFiltersForUser(filters = {}, user = null) {
@@ -709,9 +708,21 @@ function describeSharePointError(step, response, payload) {
   return `${step}: HTTP ${response.status} ${String(detail).slice(0, 200)}${hint}`.trim();
 }
 
-async function publishSummaryAttachment(pngBuffer) {
+function buildSnapshotFileName(userName) {
+  const baseName = String(userName || 'Resumo')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return `${(baseName || 'Resumo').replace(/\s+/g, ' ')}.png`;
+}
+
+async function publishSummaryAttachment(pngBuffer, options = {}) {
 
   const token = await getGraphToken();
+  const userName = String(options.userName || '').trim();
 
   const sitePath = "sites/USER-USER-EquipeProcisacpia";
   const hostname = "corpclarobr.sharepoint.com";
@@ -761,7 +772,7 @@ async function publishSummaryAttachment(pngBuffer) {
     );
   }
 
-  const fileName = "Resumo.png";;
+  const fileName = buildSnapshotFileName(userName);
 
   const uploadResponse = await fetch(
     `https://graph.microsoft.com/v1.0/drives/${drive.id}/root:/DashboardSnapshots/${fileName}:/content`,
@@ -1463,6 +1474,7 @@ app.post('/api/cache/refresh', async (req, res) => {
 app.post('/api/reports/summary-snapshot', async (req, res) => {
   try {
     const pngDataUrl = String(req.body?.pngDataUrl || '');
+    const userName = String(req.body?.userName || '').trim();
     const match = pngDataUrl.match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/);
     if (!match) return res.status(400).json({ message: 'O resumo precisa ser enviado como imagem PNG.' });
 
@@ -1471,9 +1483,9 @@ app.post('/api/reports/summary-snapshot', async (req, res) => {
       return res.status(400).json({ message: 'O PNG do resumo está vazio ou excede 6 MB.' });
     }
 
-    const itemId = await publishSummaryAttachment(pngBuffer);
-    console.log(JSON.stringify({ event: 'summary_snapshot_published', requestId: req.requestId, itemId }));
-    res.status(201).json({ ok: true, itemId });
+    const itemId = await publishSummaryAttachment(pngBuffer, { userName });
+    console.log(JSON.stringify({ event: 'summary_snapshot_published', requestId: req.requestId, itemId, userName }));
+    res.status(201).json({ ok: true, itemId, userName });
   } catch (error) {
     console.error(JSON.stringify({ event: 'summary_snapshot_error', requestId: req.requestId, message: error.message }));
     res.status(502).json({ message: 'Não foi possível publicar o resumo no SharePoint.', detail: error.message, requestId: req.requestId });
@@ -1580,6 +1592,16 @@ app.get('/api/auth/user', async (req, res) => {
   } catch (error) {
     console.error(JSON.stringify({ event: 'auth_user_error', requestId: req.requestId, message: error.message }));
     return res.status(500).json({ message: 'Não foi possível validar o usuário.', requestId: req.requestId });
+  }
+});
+
+app.get('/api/auth/users', async (req, res) => {
+  try {
+    const users = await listCollaborators();
+    return res.json({ users });
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'auth_users_error', requestId: req.requestId, message: error.message }));
+    return res.status(500).json({ message: 'Não foi possível listar os colaboradores.', requestId: req.requestId });
   }
 });
 
