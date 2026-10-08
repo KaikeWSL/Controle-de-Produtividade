@@ -105,7 +105,7 @@ function rateLimit(req, res, next) {
 }
 
 function validateDashboardQuery(req, res, next) {
-  const allowedKeys = new Set(['site', 'activity', 'subactivity', 'projetista', 'uf', 'cidade', 'mes', 'ano', 'refresh', 'page', 'pageSize']);
+  const allowedKeys = new Set(['site', 'activity', 'subactivity', 'projetista', 'uf', 'cidade', 'mes', 'ano', 'refresh', 'page', 'pageSize', 'token']);
   const invalidKey = Object.keys(req.query).find((key) => !allowedKeys.has(key));
   const invalidText = ['site', 'activity', 'subactivity', 'projetista', 'uf', 'cidade'].find((key) => String(req.query[key] || '').length > 120);
   const month = String(req.query.mes || '');
