@@ -245,7 +245,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Token']
 }));
 app.use(express.json({ limit: '8mb' }));
 
@@ -455,6 +455,85 @@ function getListNameCandidates(listName) {
 function safeString(value) {
   if (value === undefined || value === null) return '';
   return String(value).trim();
+}
+
+function normalizeAccessName(value) {
+  return safeString(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function normalizePerfilValue(value) {
+  return safeString(value || '').toUpperCase();
+}
+
+async function getAuthenticatedUserByToken(token) {
+  const userToken = safeString(token).trim();
+  if (!userToken) return null;
+
+  const authSiteUrl = 'https://corpclarobr.sharepoint.com/sites/USER-USER-EquipeProcisacpia';
+  const siteUrl = new URL(authSiteUrl);
+  const sitePath = siteUrl.pathname.replace(/\/$/, '');
+  const tokenValue = userToken;
+  const listNames = getListNameCandidates('Colaborador');
+
+  if (!listNames.length) listNames.push('Colaborador');
+
+  for (const listName of listNames) {
+    const listUrl = `https://graph.microsoft.com/v1.0/sites/${siteUrl.hostname}:${sitePath}:/lists/${encodeURIComponent(listName)}/items?$expand=fields($select=Nome_x0020_completo,Token,Perfil,Email)&$top=500`;
+    const graphToken = await getGraphToken();
+    const response = await fetch(listUrl, {
+      headers: {
+        Authorization: `Bearer ${graphToken}`,
+        Accept: 'application/json;odata.metadata=none'
+      }
+    });
+
+    if (!response.ok) {
+      if ([400, 401, 403, 404].includes(response.status)) continue;
+      const payload = await readJsonResponse(response);
+      throw new Error(`Erro ao consultar a lista de colaboradores: ${payload?.error?.message || response.statusText}`);
+    }
+
+    const payload = await readJsonResponse(response);
+    const items = Array.isArray(payload.value) ? payload.value : [];
+    const match = items.find((item) => {
+      const candidateToken = safeString(getValue(item.fields || item, 'Token'));
+      return candidateToken === tokenValue;
+    });
+
+    if (!match) continue;
+
+    const fields = match.fields || match;
+    const nome = safeString(getValue(fields, 'Nome_x0020_completo') || getValue(fields, 'Nome completo') || getValue(fields, 'Nome') || '');
+    const email = safeString(getValue(fields, 'Email') || getValue(fields, 'E_mail') || getValue(fields, 'eMail') || '');
+    const perfil = normalizePerfilValue(getValue(fields, 'Perfil') || 'PROJETISTA');
+
+    return {
+      token: tokenValue,
+      nome: nome || 'Colaborador',
+      email,
+      perfil: perfil || 'PROJETISTA'
+    };
+  }
+
+  return null;
+}
+
+function getAccessFiltersForUser(filters = {}, user = null) {
+  if (!user || normalizePerfilValue(user.perfil) !== 'ADMIN') {
+    if (!user || !user.nome) return filters;
+    return {
+      ...filters,
+      projetista: user.nome
+    };
+  }
+
+  return filters;
 }
 
 function isIgnorableProjetistaName(value) {
@@ -1479,6 +1558,31 @@ async function warmupCaches() {
   }));
 }
 
+app.get('/api/auth/user', async (req, res) => {
+  try {
+    const token = safeString(req.query.token || req.headers['x-user-token'] || req.headers.authorization?.replace(/^Bearer\s+/i, ''));
+
+    if (!token) {
+      return res.status(401).json({ message: 'Token inválido ou ausente.' });
+    }
+
+    const user = await getAuthenticatedUserByToken(token);
+    if (!user) {
+      return res.status(401).json({ message: 'Token inválido.' });
+    }
+
+    return res.json({
+      token: user.token,
+      nome: user.nome,
+      email: user.email || '',
+      perfil: user.perfil || 'PROJETISTA'
+    });
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'auth_user_error', requestId: req.requestId, message: error.message }));
+    return res.status(500).json({ message: 'Não foi possível validar o usuário.', requestId: req.requestId });
+  }
+});
+
 app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
   try {
     const requestStartedAt = Date.now();
@@ -1486,6 +1590,13 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     const activityName = req.query.activity || '';
     const subActivityName = req.query.subactivity || '';
     const selectedSite = resolveSelectedSite(siteName, activityName, subActivityName);
+    const requestToken = safeString(req.query.token || req.headers['x-user-token'] || req.headers.authorization?.replace(/^Bearer\s+/i, ''));
+    const authenticatedUser = requestToken ? await getAuthenticatedUserByToken(requestToken) : null;
+
+    if (requestToken && !authenticatedUser) {
+      return res.status(401).json({ message: 'Token inválido.' });
+    }
+
     const filters = {
       projetista: req.query.projetista || '',
       uf: req.query.uf || '',
@@ -1494,7 +1605,8 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
       ano: req.query.ano || ''
     };
 
-    const cacheKey = buildDashboardCacheKey(siteName, activityName, subActivityName, filters);
+    const restrictedFilters = getAccessFiltersForUser(filters, authenticatedUser);
+    const cacheKey = buildDashboardCacheKey(siteName, activityName, subActivityName, restrictedFilters);
     const shouldRefresh = String(req.query.refresh || '').toLowerCase() === 'true' || String(req.query.refresh || '') === '1';
 
     console.log(`[dashboard] site=${siteName} activity=${activityName} subactivity=${subActivityName} refresh=${shouldRefresh} filters=${JSON.stringify(filters)}`);
@@ -1529,8 +1641,8 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     const snapshot = await loadSourceSnapshot(selectedSite, { forceRefresh: shouldRefresh });
     const sourceMs = Date.now() - sourceStartedAt;
     const filteringStartedAt = Date.now();
-    const items = getIndexedItems(snapshot, filters);
-    const comparisonFilters = { ...filters, mes: '', ano: '' };
+    const items = getIndexedItems(snapshot, restrictedFilters);
+    const comparisonFilters = { ...restrictedFilters, mes: '', ano: '' };
     const comparisonItems = getIndexedItems(snapshot, comparisonFilters);
     const filterMs = Date.now() - filteringStartedAt;
     const analyticsKey = `analytics:${cacheKey}`;
@@ -1540,7 +1652,7 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
       : null;
     const analyticsStartedAt = Date.now();
     if (!analytics) {
-      analytics = buildExecutiveAnalytics(items, comparisonItems, filters);
+      analytics = buildExecutiveAnalytics(items, comparisonItems, restrictedFilters);
       analyticsCache.set(analyticsKey, {
         value: analytics,
         sourceCacheKey: snapshot.sourceCacheKey,
@@ -1554,7 +1666,12 @@ app.get('/api/dashboard', validateDashboardQuery, async (req, res) => {
     const result = buildResult(items, { includeUploadVisium: Boolean(selectedSite?.fields?.uploadVisium) });
     const payload = {
       site: selectedSite,
-      filters,
+      filters: restrictedFilters,
+      user: authenticatedUser ? {
+        nome: authenticatedUser.nome,
+        perfil: authenticatedUser.perfil,
+        email: authenticatedUser.email || ''
+      } : null,
       items: items.map((item) => ({
         projetista: item.projetista || '',
         uf: item.uf || '',
