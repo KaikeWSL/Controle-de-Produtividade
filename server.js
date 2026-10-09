@@ -233,26 +233,14 @@ function cleanupCaches() {
     evictSourceCache();
 }
 
-const defaultAllowedOrigins = [
-  'http://localhost:3000',
-  'http://localhost:8000',
-  'https://controleprodutividade.netlify.app'
-];
-
-const allowedOrigins = Array.from(new Set([
-  ...defaultAllowedOrigins,
-  ...(process.env.ALLOWED_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean)
-]));
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:8000')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin) return callback(null, true);
-
-    const isAllowed = allowedOrigins.includes(origin)
-      || /^https:\/\/.*\.netlify\.app$/.test(origin)
-      || /^https:\/\/.*\.vercel\.app$/.test(origin);
-
-    if (isAllowed) return callback(null, true);
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
     return callback(new Error('Origem não permitida pelo CORS.'));
   },
   credentials: true,
@@ -1430,6 +1418,28 @@ app.get('/health', (_, res) => {
   res.json({ ok: true, service: 'sharepoint-dashboard', sites: config.sites?.length || 0 });
 });
 
+app.get('/api/health', (req, res) => {
+  const source = String(req.query.source || 'unknown');
+  console.log(JSON.stringify({
+    event: 'render_health_check',
+    requestId: req.requestId,
+    source,
+    method: req.method,
+    path: req.path,
+    ip: req.ip,
+    userAgent: req.headers['user-agent']
+  }));
+
+  res.json({
+    ok: true,
+    service: 'sharepoint-dashboard',
+    status: 'ok',
+    source,
+    sites: config.sites?.length || 0,
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.get('/api/config', (_, res) => {
   res.json(getPublicConfig(config));
 });
@@ -1585,28 +1595,12 @@ async function warmupCaches() {
 app.get('/api/auth/user', async (req, res) => {
   try {
     const token = safeString(req.query.token || req.headers['x-user-token'] || req.headers.authorization?.replace(/^Bearer\s+/i, ''));
-    console.log('[server-auth] requisição recebida', {
-      requestId: req.requestId,
-      path: req.path,
-      hasToken: Boolean(token),
-      tokenPreview: token ? token.slice(0, 12) : null,
-      queryToken: req.query.token ? 'presente' : 'ausente',
-      headersToken: req.headers['x-user-token'] ? 'presente' : 'ausente'
-    });
 
     if (!token) {
-      console.warn('[server-auth] token ausente');
       return res.status(401).json({ message: 'Token inválido ou ausente.' });
     }
 
     const user = await getAuthenticatedUserByToken(token);
-    console.log('[server-auth] usuário encontrado', {
-      requestId: req.requestId,
-      userFound: Boolean(user),
-      userName: user?.nome || null,
-      perfil: user?.perfil || null
-    });
-
     if (!user) {
       return res.status(401).json({ message: 'Token inválido.' });
     }
