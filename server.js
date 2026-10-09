@@ -1573,12 +1573,28 @@ async function warmupCaches() {
 app.get('/api/auth/user', async (req, res) => {
   try {
     const token = safeString(req.query.token || req.headers['x-user-token'] || req.headers.authorization?.replace(/^Bearer\s+/i, ''));
+    console.log('[server-auth] requisição recebida', {
+      requestId: req.requestId,
+      path: req.path,
+      hasToken: Boolean(token),
+      tokenPreview: token ? token.slice(0, 12) : null,
+      queryToken: req.query.token ? 'presente' : 'ausente',
+      headersToken: req.headers['x-user-token'] ? 'presente' : 'ausente'
+    });
 
     if (!token) {
+      console.warn('[server-auth] token ausente');
       return res.status(401).json({ message: 'Token inválido ou ausente.' });
     }
 
     const user = await getAuthenticatedUserByToken(token);
+    console.log('[server-auth] usuário encontrado', {
+      requestId: req.requestId,
+      userFound: Boolean(user),
+      userName: user?.nome || null,
+      perfil: user?.perfil || null
+    });
+
     if (!user) {
       return res.status(401).json({ message: 'Token inválido.' });
     }
