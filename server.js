@@ -714,17 +714,8 @@ function describeSharePointError(step, response, payload) {
   return `${step}: HTTP ${response.status} ${String(detail).slice(0, 200)}${hint}`.trim();
 }
 
-function buildSnapshotFileName(userName) {
-  const baseName = String(userName || 'Resumo')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z0-9\s-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const safeName = (baseName || 'Resumo').replace(/\s+/g, ' ');
-  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-  return `${safeName}-${stamp}.png`;
+function buildSnapshotFileName() {
+  return 'Resumo.png';
 }
 
 async function publishSummaryAttachment(pngBuffer, options = {}) {
@@ -780,7 +771,7 @@ async function publishSummaryAttachment(pngBuffer, options = {}) {
     );
   }
 
-  const fileName = buildSnapshotFileName(userName);
+  const fileName = buildSnapshotFileName();
   const folderName = 'DashboardSnapshots';
   const folderPath = `root:/${folderName}`;
 
