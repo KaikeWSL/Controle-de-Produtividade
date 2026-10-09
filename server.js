@@ -82,7 +82,7 @@ function applySecurityHeaders(req, res, next) {
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://rak-5ph3.onrender.com");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://controle-7cfq.onrender.com");
   next();
 }
 
@@ -722,7 +722,9 @@ function buildSnapshotFileName(userName) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  return `${(baseName || 'Resumo').replace(/\s+/g, ' ')}.png`;
+  const safeName = (baseName || 'Resumo').replace(/\s+/g, ' ');
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  return `${safeName}-${stamp}.png`;
 }
 
 async function publishSummaryAttachment(pngBuffer, options = {}) {
@@ -779,9 +781,28 @@ async function publishSummaryAttachment(pngBuffer, options = {}) {
   }
 
   const fileName = buildSnapshotFileName(userName);
+  const snapshotPath = `root:/DashboardSnapshots/${fileName}`;
+
+  const existingResponse = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${drive.id}/${snapshotPath}`,
+    {
+      method: 'HEAD',
+      headers: { Authorization: `Bearer ${token}` }
+    }
+  );
+
+  if (existingResponse.ok) {
+    await fetch(
+      `https://graph.microsoft.com/v1.0/drives/${drive.id}/${snapshotPath}`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      }
+    );
+  }
 
   const uploadResponse = await fetch(
-    `https://graph.microsoft.com/v1.0/drives/${drive.id}/root:/DashboardSnapshots/${fileName}:/content`,
+    `https://graph.microsoft.com/v1.0/drives/${drive.id}/${snapshotPath}:/content`,
     {
       method: "PUT",
       headers: {
@@ -1512,8 +1533,8 @@ app.post('/api/reports/summary-snapshot', async (req, res) => {
     }
 
     const itemId = await publishSummaryAttachment(pngBuffer, { userName });
-    console.log(JSON.stringify({ event: 'summary_snapshot_published', requestId: req.requestId, itemId, userName }));
-    res.status(201).json({ ok: true, itemId, userName });
+    console.log(JSON.stringify({ event: 'summary_snapshot_published', requestId: req.requestId, itemId, userName, updated: true }));
+    res.status(201).json({ ok: true, itemId, userName, updated: true });
   } catch (error) {
     console.error(JSON.stringify({ event: 'summary_snapshot_error', requestId: req.requestId, message: error.message }));
     res.status(502).json({ message: 'Não foi possível publicar o resumo no SharePoint.', detail: error.message, requestId: req.requestId });
