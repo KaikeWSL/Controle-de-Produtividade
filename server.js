@@ -120,6 +120,12 @@ function validateDashboardQuery(req, res, next) {
   next();
 }
 
+app.use(cors({
+  origin: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-token', 'X-Requested-With']
+}));
+app.options('*', cors());
 app.use(applySecurityHeaders);
 app.use(compression({ threshold: 1024 }));
 app.use(rateLimit);
