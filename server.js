@@ -721,7 +721,8 @@ function buildSnapshotFileName() {
 async function publishSummaryAttachment(pngBuffer, options = {}) {
 
   const token = await getGraphToken();
-  const userName = String(options.userName || '').trim();
+  const sourceName = String(options.userName || '').trim();
+  const userName = sourceName && sourceName !== 'Resumo' ? 'Resumo' : 'Resumo';
 
   const sitePath = "sites/USER-USER-EquipeProcisacpia";
   const hostname = "corpclarobr.sharepoint.com";
@@ -850,7 +851,7 @@ async function publishSummaryAttachment(pngBuffer, options = {}) {
     itemId: uploadData.id,
     webUrl: uploadData.webUrl,
     parentPath: `/${folderName}`,
-    userName
+    userName: 'Resumo'
   }));
 
   return uploadData.id;
