@@ -781,7 +781,40 @@ async function publishSummaryAttachment(pngBuffer, options = {}) {
   }
 
   const fileName = buildSnapshotFileName(userName);
-  const snapshotPath = `root:/DashboardSnapshots/${fileName}`;
+  const folderName = 'DashboardSnapshots';
+  const folderPath = `root:/${folderName}`;
+
+  let folderResponse = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${drive.id}/${folderPath}`,
+    {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` }
+    }
+  );
+
+  if (folderResponse.status === 404) {
+    folderResponse = await fetch(
+      `https://graph.microsoft.com/v1.0/drives/${drive.id}/root/children`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          name: folderName,
+          folder: {}
+        })
+      }
+    );
+
+    if (!folderResponse.ok) {
+      const folderData = await folderResponse.json().catch(() => ({}));
+      throw new Error(`Erro ao criar a pasta ${folderName}: ${JSON.stringify(folderData)}`);
+    }
+  }
+
+  const snapshotPath = `root:/${folderName}/${fileName}`;
 
   const existingResponse = await fetch(
     `https://graph.microsoft.com/v1.0/drives/${drive.id}/${snapshotPath}`,
@@ -813,14 +846,21 @@ async function publishSummaryAttachment(pngBuffer, options = {}) {
     }
   );
 
-  const uploadData =
-    await uploadResponse.json();
+  const uploadData = await uploadResponse.json().catch(() => ({}));
 
   if (!uploadResponse.ok) {
-    throw new Error(
-      `Erro ao enviar imagem: ${JSON.stringify(uploadData)}`
-    );
+    throw new Error(`Erro ao enviar imagem: ${JSON.stringify(uploadData)}`);
   }
+
+  console.log(JSON.stringify({
+    event: 'summary_snapshot_uploaded',
+    folder: folderName,
+    fileName,
+    itemId: uploadData.id,
+    webUrl: uploadData.webUrl,
+    parentPath: `/${folderName}`,
+    userName
+  }));
 
   return uploadData.id;
 }
